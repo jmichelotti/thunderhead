@@ -915,6 +915,15 @@ window.addEventListener("message", (e) => {
       type: "brocoflixDoneSignal",
       sessionId: msg.sessionId,
     });
+  } else if (msg.type === "hlsBrocoNeedReload") {
+    console.log(`[BF-relay] Reload requested (${msg.reason}): ${msg.completedIndices.length}/${msg.totalSegments} done`);
+    chrome.runtime.sendMessage({
+      type: "brocoflixNeedReload",
+      sessionId: msg.sessionId,
+      completedIndices: msg.completedIndices,
+      totalSegments: msg.totalSegments,
+      reason: msg.reason,
+    });
   } else if (msg.type === "hlsBrocoError") {
     console.log(`[BF-relay] Download error: ${msg.error}`);
     chrome.runtime.sendMessage({

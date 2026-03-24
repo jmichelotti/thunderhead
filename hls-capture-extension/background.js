@@ -123,9 +123,46 @@ chrome.webRequest.onBeforeRequest.addListener(
       console.log(`[HLS]   pageUrl: ${pageUrl}`);
 
       // BrocoFlix: use browser-side download (CDN blocks non-browser clients)
+      // During auto-capture, start immediately (no confirmation needed).
+      // Otherwise, queue into pending like 1movies so user gets a confirmation dialog.
       if (siteCtx?.site === "brocoflix.xyz" && details.frameId > 0) {
-        startBrocoflixDownload(url, pageUrl, tabId, details.frameId);
-        return;  // don't fall through to yt-dlp / pending queue
+        // Check if this m3u8 is from an iframe reload for connection recovery.
+        // If so, resume the existing download with the new m3u8 URL + fresh frameId.
+        for (const [sid, rs] of brocoflixReloadState.entries()) {
+          if (rs.tabId === tabId) {
+            console.log(`[BF] New m3u8 intercepted after reload for session ${sid}. Resuming with ${rs.completedIndices.length} completed segments.`);
+            brocoflixReloadState.delete(sid);
+            // Update the session's m3u8Url to the new one (new CDN domain)
+            const session = brocoflixSessions.get(sid);
+            if (session) {
+              session.m3u8Url = url;
+              session.frameId = details.frameId;
+            }
+            startBrocoflixDownload(url, pageUrl, tabId, details.frameId, {
+              sessionId: sid,
+              completedIndices: rs.completedIndices,
+            });
+            return;
+          }
+        }
+
+        if (tabId === autoCapture.tabId &&
+            (autoCapture.active || Date.now() < autoCapture.graceUntil)) {
+          startBrocoflixDownload(url, pageUrl, tabId, details.frameId);
+          return;
+        }
+        // Fall through to pending queue — store frameId for use at confirmation time
+        brocoflixPendingFrameId = details.frameId;
+
+        // Clear stale episode context if the page URL changed (e.g. navigated
+        // from one movie to another on the same tab)
+        const existingCtx = episodeContextByTab.get(tabId);
+        if (existingCtx && existingCtx._pageUrl && existingCtx._pageUrl !== pageUrl) {
+          episodeContextByTab.delete(tabId);
+        }
+
+        // Episode context is populated in fetchPreview for BrocoFlix
+        // (needs to be awaited, can't do it reliably in this sync callback)
       }
 
       // Auto-capture mode: skip pending queue, auto-confirm immediately.
@@ -176,10 +213,12 @@ chrome.webRequest.onBeforeRequest.addListener(
         m3u8_url: url,
         page_url: pageUrl,
         tabId: tabId,
+        frameId: brocoflixPendingFrameId || null,  // BrocoFlix needs this at confirm time
         timestamp: Date.now(),
         preview: null,
         previewStatus: "loading",
       };
+      brocoflixPendingFrameId = null;  // consumed
       pendingCaptures.push(pending);
 
       // Keep only last 20 pending
@@ -202,8 +241,70 @@ chrome.webRequest.onBeforeRequest.addListener(
 
 // ========= PREVIEW / CONFIRM / SEND =========
 
+// Probe m3u8 resolution from within the embed iframe (CDN blocks server-side probing).
+// Returns a string like "1920x1080" or null.
+async function probeBrocoflixQuality(tabId, frameId, m3u8Url) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: "MAIN",
+      func: (url) => {
+        return fetch(url).then(r => r.text()).then(manifest => {
+          let best = null, bestH = 0;
+          for (const line of manifest.split("\n")) {
+            const m = line.match(/RESOLUTION=(\d+)x(\d+)/);
+            if (m) {
+              const h = parseInt(m[2], 10);
+              if (h > bestH) { bestH = h; best = m[1] + "x" + m[2]; }
+            }
+          }
+          return best;
+        }).catch(() => null);
+      },
+      args: [m3u8Url],
+    });
+    return results?.[0]?.result || null;
+  } catch (err) {
+    console.log(`[BF] Quality probe failed: ${err.message}`);
+    return null;
+  }
+}
+
 async function fetchPreview(pending, index) {
+  // For BrocoFlix, ensure episode context exists (movies have no card click to set it)
+  // and probe quality from the browser (CDN 403s yt-dlp)
+  let browserQuality = null;
+  if (pending.frameId) {
+    if (!episodeContextByTab.has(pending.tabId)) {
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: pending.tabId },
+          func: () => {
+            const h1 = document.querySelector("#details-container h1");
+            return h1?.textContent?.trim() || document.title.replace(/\s*[\|–\-].*$/, "").trim();
+          },
+        });
+        const title = results?.[0]?.result || "";
+        if (title) {
+          const isMovie = pending.page_url.includes("type=movie");
+          episodeContextByTab.set(pending.tabId, {
+            show_name: title,
+            season: isMovie ? null : 1,
+            episode: isMovie ? null : 1,
+            _pageUrl: pending.page_url,  // track for stale context detection
+          });
+          console.log(`[BF] Set episode context from DOM: "${title}" isMovie=${isMovie}`);
+        }
+      } catch (err) {
+        console.log(`[BF] Failed to get page title: ${err.message}`);
+      }
+    }
+    browserQuality = await probeBrocoflixQuality(pending.tabId, pending.frameId, pending.m3u8_url);
+    console.log(`[BF] Browser quality probe: ${browserQuality || "unknown"}`);
+  }
+
   const ctx = episodeContextByTab.get(pending.tabId) || {};
+
   try {
     const resp = await fetch(PREVIEW_URL, {
       method: "POST",
@@ -214,6 +315,7 @@ async function fetchPreview(pending, index) {
         show_name: ctx.show_name || "",
         season: ctx.season ?? null,
         episode: ctx.episode ?? null,
+        quality: browserQuality,  // server skips yt-dlp probe when provided
       }),
     });
 
@@ -265,6 +367,13 @@ async function confirmDownload(index) {
   if (index < 0 || index >= pendingCaptures.length) return;
 
   const pending = pendingCaptures.splice(index, 1)[0];
+
+  // BrocoFlix: route to browser-side download instead of yt-dlp
+  if (pending.frameId) {
+    updateBadge();
+    startBrocoflixDownload(pending.m3u8_url, pending.page_url, pending.tabId, pending.frameId);
+    return;
+  }
 
   const capture = {
     m3u8_url: pending.m3u8_url,
@@ -430,6 +539,15 @@ async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
 const brocoflixSessions = new Map();
 // Dedup: prevent multiple startBrocoflixDownload calls for the same m3u8 URL
 const brocoflixActiveUrls = new Set();
+// Temporarily holds frameId between webRequest callback and pending object creation
+let brocoflixPendingFrameId = null;
+// Track reload-recovery state: when the iframe is reloaded to get a fresh connection pool,
+// this holds the completed segment indices so the re-injected downloader can skip them.
+// Key: sessionId, Value: { tabId, completedIndices: Set<int>, totalSegments, pageUrl,
+//                          epKey, resolve: fn(m3u8Url, frameId) }
+const brocoflixReloadState = new Map();
+// Max segments to download before proactively reloading the iframe to avoid HTTP/2 GOAWAY
+const BROCOFLIX_RELOAD_THRESHOLD = 800;
 
 function cleanupBrocoflixSession(sessionId) {
   const session = brocoflixSessions.get(sessionId);
@@ -437,13 +555,15 @@ function cleanupBrocoflixSession(sessionId) {
   brocoflixSessions.delete(sessionId);
 }
 
-async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId) {
+async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOpts) {
+  // resumeOpts: { sessionId, completedIndices: number[] } when resuming after iframe reload
   // Client-side dedup: skip if this exact URL is already being downloaded
-  if (brocoflixActiveUrls.has(m3u8Url)) {
+  // (but allow through if this is a resume after iframe reload)
+  if (!resumeOpts && brocoflixActiveUrls.has(m3u8Url)) {
     console.log(`[BF] Skipping duplicate m3u8 (already in progress): ${m3u8Url.slice(0, 80)}`);
     return;
   }
-  brocoflixActiveUrls.add(m3u8Url);
+  if (!resumeOpts) brocoflixActiveUrls.add(m3u8Url);
 
   let epCtx = episodeContextByTab.get(tabId);
 
@@ -468,70 +588,94 @@ async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId) {
   }
 
   epCtx = epCtx || {};
-  console.log(`[BF] Starting download: frameId=${frameId} show="${epCtx.show_name}" S${epCtx.season}E${epCtx.episode}`);
 
-  // Start session on server
-  let startData;
-  try {
-    const resp = await fetch("http://localhost:9876/brocoflix-start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        m3u8_url: m3u8Url,
-        page_url: pageUrl,
-        show_name: epCtx.show_name || "",
-        season: epCtx.season ?? null,
-        episode: epCtx.episode ?? null,
-      }),
-    });
-    startData = await resp.json();
-  } catch (err) {
-    console.log(`[BF] Server not running: ${err.message}`);
-    brocoflixActiveUrls.delete(m3u8Url);
-    return;
+  let sessionId, epKey;
+
+  if (resumeOpts) {
+    // Resuming after iframe reload — reuse existing session
+    sessionId = resumeOpts.sessionId;
+    const session = brocoflixSessions.get(sessionId);
+    epKey = session?.epKey || "";
+    // Update frameId since the iframe was reloaded
+    if (session) session.frameId = frameId;
+    console.log(`[BF] Resuming download after iframe reload: sessionId=${sessionId} frameId=${frameId} completed=${resumeOpts.completedIndices.length} segments`);
+  } else {
+    // Fresh download — create new session on server
+    console.log(`[BF] Starting download: frameId=${frameId} show="${epCtx.show_name}" S${epCtx.season}E${epCtx.episode}`);
+
+    let startData;
+    try {
+      const resp = await fetch("http://localhost:9876/brocoflix-start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          m3u8_url: m3u8Url,
+          page_url: pageUrl,
+          show_name: epCtx.show_name || "",
+          season: epCtx.season ?? null,
+          episode: epCtx.episode ?? null,
+        }),
+      });
+      startData = await resp.json();
+    } catch (err) {
+      console.log(`[BF] Server not running: ${err.message}`);
+      brocoflixActiveUrls.delete(m3u8Url);
+      return;
+    }
+
+    if (startData.status !== "ok") {
+      console.log(`[BF] Start rejected: ${startData.status} — ${startData.message}`);
+      brocoflixActiveUrls.delete(m3u8Url);
+      return;
+    }
+
+    sessionId = startData.session_id;
+    epKey = startData.ep_key;
+    console.log(`[BF] Session created: ${sessionId} → ${startData.filename}`);
+
+    brocoflixSessions.set(sessionId, { tabId, frameId, epKey, m3u8Url, pageUrl });
+
+    // Register in captures for popup display
+    const capture = {
+      m3u8_url: m3u8Url,
+      page_url: pageUrl,
+      tabId,
+      timestamp: Date.now(),
+      status: "uploading",
+      message: startData.filename,
+    };
+    captures.push(capture);
+    if (captures.length > 50) captures = captures.slice(-50);
+    updateBadge();
   }
 
-  if (startData.status !== "ok") {
-    console.log(`[BF] Start rejected: ${startData.status} — ${startData.message}`);
-    brocoflixActiveUrls.delete(m3u8Url);
-    return;
-  }
-
-  const sessionId = startData.session_id;
-  const epKey = startData.ep_key;
-  console.log(`[BF] Session created: ${sessionId} → ${startData.filename}`);
-
-  brocoflixSessions.set(sessionId, { tabId, frameId, epKey, m3u8Url });
-
-  // Register in captures for popup display
-  const capture = {
-    m3u8_url: m3u8Url,
-    page_url: pageUrl,
-    tabId,
-    timestamp: Date.now(),
-    status: "uploading",
-    message: startData.filename,
-  };
-  captures.push(capture);
-  if (captures.length > 50) captures = captures.slice(-50);
-  updateBadge();
+  const completedIndices = resumeOpts?.completedIndices || [];
 
   // Inject the MAIN-world downloader into the embed iframe
   chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     func: brocoflixDownloaderFunc,
-    args: [m3u8Url, sessionId],
+    args: [m3u8Url, sessionId, completedIndices, BROCOFLIX_RELOAD_THRESHOLD],
   }).catch(err => {
     console.log(`[BF] Injection failed: ${err.message}`);
-    cleanupBrocoflixSession(sessionId);
+    if (!resumeOpts) cleanupBrocoflixSession(sessionId);
   });
 }
 
 // This function is injected into the embed iframe's MAIN world.
-// It fetches the m3u8 manifest, downloads all TS segments, and posts
-// them to the content script relay via window.postMessage.
-function brocoflixDownloaderFunc(m3u8Url, sessionId) {
+// It fetches the m3u8 manifest, downloads TS segments, and posts them
+// to the content script relay via window.postMessage.
+//
+// Reload-recovery strategy: instead of retrying failed segments on the same
+// connection (which never works due to HTTP/2 GOAWAY / Chrome socket pool
+// poisoning), the downloader stops on first failure and asks the background
+// to reload the iframe for a fresh CDN domain + connection pool. It also
+// proactively requests a reload every `reloadThreshold` segments to stay
+// under the GOAWAY limit.
+function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThreshold) {
+  const alreadyDone = new Set(completedIndices || []);
+
   async function blobToBase64(blob) {
     return new Promise((resolve) => {
       const reader = new FileReader();
@@ -545,7 +689,7 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const resp = await fetch(url, { signal: controller.signal });
+      const resp = await fetch(url, { signal: controller.signal, cache: "no-store" });
       clearTimeout(timer);
       return resp;
     } catch (err) {
@@ -608,11 +752,9 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId) {
   async function run() {
     try {
       // Pause the video player so it stops competing for CDN bandwidth.
-      // The HLS player fetches segments too, sharing the same rate limit.
       try {
         const videos = document.querySelectorAll("video");
         videos.forEach(v => { v.pause(); v.src = ""; v.load(); });
-        // Also try to destroy common HLS player instances
         if (window.jwplayer) try { window.jwplayer().remove(); } catch {}
         if (window.hls) try { window.hls.destroy(); } catch {}
         if (window.player?.destroy) try { window.player.destroy(); } catch {}
@@ -621,89 +763,138 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId) {
         relayLog(`[BF-dl] Video pause failed (non-fatal): ${e.message}`);
       }
 
-      let segments = await fetchManifestSegments();
+      const segments = await fetchManifestSegments();
       if (segments.length === 0) throw new Error("No segments found in m3u8");
 
-      relayLog(`[BF-dl] ${segments.length} segments to download`);
+      const totalSegs = segments.length;
+      const remaining = totalSegs - alreadyDone.size;
+
+      // Retry pass: only fetch missing segments with longer delays between attempts
+      const isRetryPass = remaining <= 20 && alreadyDone.size > 0;
+      const THROTTLE_MS = isRetryPass ? 10000 : 500;
+      const MAX_CONSECUTIVE_FAILS = isRetryPass ? remaining + 1 : 10;
+
+      relayLog(`[BF-dl] ${totalSegs} segments in manifest, ${alreadyDone.size} already done, ${remaining} remaining${isRetryPass ? ` (RETRY PASS: ${THROTTLE_MS/1000}s between fetches)` : ""}`);
 
       window.postMessage(
-        {
-          type: "hlsBrocoStart",
-          sessionId,
-          totalChunks: segments.length,
-        },
+        { type: "hlsBrocoStart", sessionId, totalChunks: totalSegs },
         "*"
       );
+      let segsFetchedThisCycle = 0;
+      let consecutiveFails = 0;
+      const failedThisCycle = []; // segment indices that failed this cycle
+      const allCompleted = new Set(alreadyDone);
 
-      // Download each segment with unlimited retry and adaptive throttling.
-      // CDN rate-limits after ~100 fast requests, so we start at 200ms and
-      // increase to 1s after the first failure, giving the CDN time to cool down.
-      let throttleMs = 200;
-      let manifestRefreshCount = 0;
-      let totalRetries = 0;
-      for (let i = 0; i < segments.length; i++) {
-        let blob = null;
-        let attempt = 0;
-        while (!blob) {
-          try {
-            if (attempt > 0) {
-              // Exponential backoff capped at 120s: 3, 6, 12, 24, 48, 96, 120, 120, ...
-              const delay = Math.min(3000 * Math.pow(2, attempt - 1), 120000);
-              relayLog(`[BF-dl] Retry #${attempt} for segment ${i}/${segments.length} (waiting ${delay / 1000}s)`);
-              await new Promise(r => setTimeout(r, delay));
-            }
-            // Every 3rd retry, refresh the manifest to get fresh CDN URLs
-            if (attempt > 0 && attempt % 3 === 0 && manifestRefreshCount < 10) {
-              relayLog(`[BF-dl] Refreshing m3u8 manifest for fresh segment URLs...`);
-              try {
-                const freshSegments = await fetchManifestSegments();
-                if (freshSegments.length === segments.length) {
-                  segments = freshSegments;
-                  manifestRefreshCount++;
-                  relayLog(`[BF-dl] Manifest refreshed (${manifestRefreshCount}x)`);
-                }
-              } catch (refreshErr) {
-                relayLog(`[BF-dl] Manifest refresh failed: ${refreshErr.message}`);
-              }
-            }
-            const segResp = await fetchWithTimeout(segments[i], 30000);
-            if (!segResp.ok)
-              throw new Error(`HTTP ${segResp.status}`);
-            blob = await segResp.blob();
-          } catch (err) {
-            attempt++;
-            totalRetries++;
-            relayLog(`[BF-dl] Segment ${i} attempt ${attempt} failed: ${err.message}`);
-            // After first failure, slow down permanently to avoid re-triggering rate limit
-            if (throttleMs < 1500) {
-              throttleMs = 1500;
-              relayLog(`[BF-dl] Rate limited — throttle increased to ${throttleMs}ms/segment`);
-            }
+      // Server appends chunks in receive order, so we send in segment-index order.
+      // Buffer downloaded data past any gap until the gap is filled.
+      const downloaded = new Array(totalSegs).fill(null);
+      let sendCursor = 0;
+
+      // Advance sendCursor past segments already sent in prior cycles.
+      while (sendCursor < totalSegs && alreadyDone.has(sendCursor)) {
+        sendCursor++;
+      }
+
+      function flushToServer() {
+        while (sendCursor < totalSegs) {
+          if (alreadyDone.has(sendCursor)) {
+            sendCursor++;
+            continue;
+          }
+          if (downloaded[sendCursor] === null) break;
+          window.postMessage(
+            {
+              type: "hlsBrocoChunk",
+              sessionId,
+              chunkIndex: sendCursor,
+              totalChunks: totalSegs,
+              data: downloaded[sendCursor],
+            },
+            "*"
+          );
+          downloaded[sendCursor] = null; // free memory
+          sendCursor++;
+        }
+      }
+
+      let needsReload = false;
+      let reloadReason = "";
+
+      for (let segIdx = 0; segIdx < totalSegs; segIdx++) {
+        if (alreadyDone.has(segIdx)) continue;
+
+        // Proactive reload before GOAWAY threshold
+        if (reloadThreshold > 0 && segsFetchedThisCycle >= reloadThreshold) {
+          flushToServer();
+          needsReload = true;
+          reloadReason = "proactive";
+          relayLog(`[BF-dl] Proactive reload after ${segsFetchedThisCycle} segments. ${allCompleted.size}/${totalSegs} total done, ${failedThisCycle.length} skipped.`);
+          break;
+        }
+
+        let ok = false;
+        try {
+          const segResp = await fetchWithTimeout(segments[segIdx]);
+          if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
+          const blob = await segResp.blob();
+          downloaded[segIdx] = await blobToBase64(blob);
+          ok = true;
+        } catch (err) {
+          relayLog(`[BF-dl] Segment ${segIdx} FAILED: ${err.message} — skipping`);
+        }
+
+        if (ok) {
+          segsFetchedThisCycle++;
+          consecutiveFails = 0;
+          allCompleted.add(segIdx);
+          flushToServer();
+
+          if (allCompleted.size % 50 === 0) {
+            relayLog(`[BF-dl] Progress: ${allCompleted.size}/${totalSegs} done (cycle: ${segsFetchedThisCycle}, skipped: ${failedThisCycle.length})`);
+          }
+        } else {
+          failedThisCycle.push(segIdx);
+          consecutiveFails++;
+
+          // If many consecutive segments fail, the connection is dead — stop early
+          if (consecutiveFails >= MAX_CONSECUTIVE_FAILS) {
+            flushToServer();
+            needsReload = true;
+            reloadReason = "consecutive_fails";
+            relayLog(`[BF-dl] ${MAX_CONSECUTIVE_FAILS} consecutive failures — connection dead. ${allCompleted.size}/${totalSegs} done, ${failedThisCycle.length} skipped. Requesting reload...`);
+            break;
           }
         }
 
-        const base64 = await blobToBase64(blob);
-
-        window.postMessage(
-          {
-            type: "hlsBrocoChunk",
-            sessionId,
-            chunkIndex: i,
-            totalChunks: segments.length,
-            data: base64,
-          },
-          "*"
-        );
-
-        // Progress log every 50 segments
-        if (i > 0 && i % 50 === 0) {
-          relayLog(`[BF-dl] Progress: ${i}/${segments.length} segments (${totalRetries} retries so far, ${throttleMs}ms throttle)`);
-        }
-
-        // Adaptive throttle between segments
-        await new Promise(r => setTimeout(r, throttleMs));
+        await new Promise(r => setTimeout(r, THROTTLE_MS));
       }
 
+      flushToServer();
+
+      // If we have failed segments or need a proactive reload, request one
+      if (!needsReload && failedThisCycle.length > 0) {
+        needsReload = true;
+        reloadReason = "retry_failures";
+        relayLog(`[BF-dl] Pass complete. ${allCompleted.size}/${totalSegs} done, ${failedThisCycle.length} failed: [${failedThisCycle.join(",")}]. Requesting reload to retry...`);
+      }
+
+      if (needsReload) {
+        window.postMessage({
+          type: "hlsBrocoNeedReload",
+          sessionId,
+          completedIndices: [...allCompleted],
+          totalSegments: totalSegs,
+          reason: reloadReason,
+        }, "*");
+        return; // background will reload iframe and re-inject us
+      }
+
+      // All segments downloaded!
+      if (sendCursor < totalSegs) {
+        throw new Error(`Only ${sendCursor}/${totalSegs} segments sent to server`);
+      }
+
+      relayLog(`[BF-dl] All ${totalSegs} segments complete!`);
       window.postMessage({ type: "hlsBrocoDone", sessionId }, "*");
     } catch (err) {
       window.postMessage(
@@ -1149,6 +1340,173 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
     })();
     return true; // async response
+  } else if (msg.type === "brocoflixNeedReload") {
+    // MAIN-world downloader hit a failure or proactive threshold — needs fresh connection pool.
+    // Reload the embed iframe to get a new CDN domain, then re-inject with the skip list.
+    const { sessionId, completedIndices, totalSegments, reason } = msg;
+    const session = brocoflixSessions.get(sessionId);
+    if (!session) {
+      console.log(`[BF] Reload requested for unknown session ${sessionId}`);
+      sendResponse({ ok: false });
+      return;
+    }
+
+    const tabId = session.tabId;
+    const pageUrl = session.pageUrl;
+
+    // Track reload count and detect if we're stuck (no progress between reloads)
+    session.reloadCount = (session.reloadCount || 0) + 1;
+    const prevCompleted = session.lastCompletedCount || 0;
+    session.lastCompletedCount = completedIndices.length;
+    const madeProgress = completedIndices.length > prevCompleted;
+    const MAX_NO_PROGRESS_RELOADS = 3;
+    const MAX_TOTAL_RELOADS = 15; // hard limit to prevent infinite loops
+
+    if (!madeProgress) {
+      session.noProgressReloads = (session.noProgressReloads || 0) + 1;
+    } else {
+      session.noProgressReloads = 0;
+    }
+
+    const completionPct = (completedIndices.length / totalSegments * 100).toFixed(1);
+    const missing = totalSegments - completedIndices.length;
+    const TARGET_PCT = 99.5;
+    const meetsTarget = parseFloat(completionPct) >= TARGET_PCT;
+
+    console.log(`[BF] Iframe reload #${session.reloadCount} (${reason}): ${completedIndices.length}/${totalSegments} (${completionPct}%) done, ${missing} missing, target=${TARGET_PCT}%, progress=${madeProgress}, stalled=${session.noProgressReloads}/${MAX_NO_PROGRESS_RELOADS}`);
+
+    // Give up if:
+    // 1. Meets 99.5% target AND stalled — we're done, mux it
+    // 2. Below target but stalled for 5+ reloads — segments are permanently blocked by CDN
+    // 3. Hit hard reload limit
+    const shouldGiveUp = (meetsTarget && session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS)
+      || session.noProgressReloads >= MAX_NO_PROGRESS_RELOADS + 2
+      || session.reloadCount >= MAX_TOTAL_RELOADS;
+    if (shouldGiveUp) {
+      const reason2 = session.reloadCount >= MAX_TOTAL_RELOADS
+        ? `Hit max ${MAX_TOTAL_RELOADS} reloads`
+        : meetsTarget
+          ? `Reached ${completionPct}% (>= ${TARGET_PCT}% target) and stalled`
+          : `Stalled at ${completionPct}% (${missing} segments permanently blocked by CDN) — best achievable`;
+      console.log(`[BF] ${reason2}. Finishing with ${missing} segments missing.`);
+      // Tell the MAIN-world we're done (skip missing segments)
+      // Post a done signal — the server will mux whatever chunks we sent
+      fetch("http://localhost:9876/brocoflix-done", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, ep_key: session.epKey }),
+      }).then(r => r.json()).then(result => {
+        console.log(`[BF] Forced mux result (${missing} segments missing): ${result.status} ${result.message || result.filename || ""}`);
+      }).catch(err => {
+        console.log(`[BF] Forced mux failed: ${err.message}`);
+      });
+      cleanupBrocoflixSession(sessionId);
+      sendResponse({ ok: true });
+      return;
+    }
+
+    // Store the reload state so we can resume when the new m3u8 is intercepted
+    brocoflixReloadState.set(sessionId, {
+      tabId,
+      completedIndices,
+      totalSegments,
+      pageUrl,
+    });
+
+    // Cancel any previous reload timer for this session before setting a new one.
+    // Without this, a timer from reload #N can fire during reload #N+1's retry pass
+    // (which takes ~90s for 9 segments × 10s) and abort the session prematurely.
+    const session2 = brocoflixSessions.get(sessionId);
+    if (session2?._reloadTimer) clearTimeout(session2._reloadTimer);
+    const reloadTimer = setTimeout(() => {
+      if (brocoflixReloadState.has(sessionId)) {
+        console.log(`[BF] Reload timeout for session ${sessionId} — no new m3u8 after 120s. Aborting.`);
+        brocoflixReloadState.delete(sessionId);
+        fetch("http://localhost:9876/brocoflix-abort", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        }).catch(() => {});
+        cleanupBrocoflixSession(sessionId);
+      }
+    }, 120000);
+    if (session2) session2._reloadTimer = reloadTimer;
+
+    // Allow the new m3u8 to be intercepted (clear dedup)
+    seenM3u8.clear();
+
+    // Reload ONLY the embed iframe (not the whole page, which would lose the player).
+    // Clearing the iframe src and restoring it forces a fresh load with new CDN domain
+    // and a clean Chrome socket pool. Then auto-click the play button inside the iframe
+    // so the HLS player loads and fires the m3u8 request without manual intervention.
+    chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const iframe = document.querySelector("iframe");
+        if (!iframe || !iframe.src) return "no_iframe";
+        let src = iframe.src;
+        // Force autoPlay so the player starts without a manual click
+        src = src.replace("autoPlay=false", "autoPlay=true");
+        iframe.src = "";
+        // Small delay to ensure the old connection pool is torn down
+        setTimeout(() => { iframe.src = src; }, 500);
+        return "ok";
+      },
+    }).then(results => {
+      const r = results?.[0]?.result;
+      if (r === "ok") {
+        console.log(`[BF] Embed iframe reloaded. Will auto-click play button in iframe...`);
+        // Wait for iframe to load, then inject into ALL frames (allFrames: true)
+        // to avoid needing webNavigation permission. The injected function
+        // checks if it's in the right frame before clicking.
+        setTimeout(() => {
+          chrome.scripting.executeScript({
+            target: { tabId, allFrames: true },
+            world: "MAIN",
+            func: () => {
+              // Only act inside the embed iframe, not the top-level BrocoFlix page
+              if (window === window.top) return null;
+              function tryClick() {
+                const selectors = [
+                  "#btn-play", ".play-button", ".jw-icon-display", ".vjs-big-play-button",
+                  "[aria-label='Play']", "button.player-btn", ".plyr__control--overlaid",
+                  ".play-overlay", ".play_btn", "#play-btn",
+                ];
+                for (const sel of selectors) {
+                  const el = document.querySelector(sel);
+                  if (el) { el.click(); return sel; }
+                }
+                const video = document.querySelector("video");
+                if (video) { video.click(); return "video"; }
+                return null;
+              }
+              let clicked = tryClick();
+              if (!clicked) {
+                let attempts = 0;
+                const timer = setInterval(() => {
+                  clicked = tryClick();
+                  attempts++;
+                  if (clicked || attempts >= 10) clearInterval(timer);
+                }, 500);
+              }
+              return clicked;
+            },
+          }).then(results => {
+            const clicks = results?.filter(r => r.result).map(r => r.result);
+            console.log(`[BF] Auto-play click results: ${clicks.length ? clicks.join(", ") : "retrying via interval..."}`);
+          }).catch(err => {
+            console.log(`[BF] Auto-play inject failed: ${err.message}`);
+          });
+        }, 3000); // wait 3s for iframe to fully load
+      } else {
+        console.log(`[BF] Iframe reload problem: ${r}. Falling back to full tab reload.`);
+        chrome.tabs.reload(tabId);
+      }
+    }).catch(err => {
+      console.log(`[BF] Iframe reload script failed: ${err.message}. Falling back to full tab reload.`);
+      chrome.tabs.reload(tabId);
+    });
+    sendResponse({ ok: true });
   } else if (msg.type === "brocoflixErrorSignal") {
     const { sessionId, error } = msg;
     console.log(`[BF] Download FAILED: ${error}`);

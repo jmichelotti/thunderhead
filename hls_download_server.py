@@ -225,6 +225,70 @@ def update_download(ep_key: str, **kwargs):
             _downloads[ep_key].update(kwargs)
 
 
+def fix_metadata_for_jellyfin(mp4_path: Path, label: str = "") -> bool:
+    """Remux an MP4 to fix broken encoder metadata (hls.js / dailymotion tags).
+
+    Rewrites the file in-place using stream-copy (no re-encode, near-instant).
+    Returns True if the file was fixed (or was already fine), False on error.
+    """
+    ENCODER_PATTERNS = ["hls.js", "dailymotion"]
+
+    # Probe the file for encoder tags
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        str(mp4_path),
+    ]
+    try:
+        result = subprocess.run(
+            probe_cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+        info = json.loads(result.stdout)
+    except Exception as e:
+        print(f"  {label} [metadata fix] ffprobe failed: {e}", flush=True)
+        return True  # non-fatal, skip fix
+
+    # Check format-level and stream-level encoder tags
+    needs_fix = False
+    for tags_source in [info.get("format", {})] + info.get("streams", []):
+        enc = (tags_source.get("tags", {}) or {}).get("encoder", "").lower()
+        if any(p in enc for p in ENCODER_PATTERNS):
+            needs_fix = True
+            break
+
+    if not needs_fix:
+        return True
+
+    # Remux in-place: copy to temp, replace original
+    tmp_path = mp4_path.with_suffix(".fixing.mp4")
+    remux_cmd = [
+        "ffmpeg", "-y",
+        "-i", str(mp4_path),
+        "-map", "0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(tmp_path),
+    ]
+    print(f"  {label} [metadata fix] Remuxing to strip bad encoder tags...", flush=True)
+    try:
+        proc = subprocess.run(remux_cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            print(f"  {label} [metadata fix] ffmpeg failed (exit {proc.returncode})", flush=True)
+            tmp_path.unlink(missing_ok=True)
+            return False
+        # Replace original with fixed file
+        mp4_path.unlink()
+        tmp_path.rename(mp4_path)
+        print(f"  {label} [metadata fix] Done — bad encoder tags stripped", flush=True)
+        return True
+    except Exception as e:
+        print(f"  {label} [metadata fix] Error: {e}", flush=True)
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
 def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) -> str:
     """Download an m3u8 stream using yt-dlp. Returns status message."""
     if dry_run:
@@ -313,6 +377,9 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
             continue
         sub_dest = output_path.parent / sub_file.name
         shutil.move(str(sub_file), str(sub_dest))
+
+    # Fix broken encoder metadata (hls.js tags) before marking done
+    fix_metadata_for_jellyfin(output_path, label=f"[{ep_key}]")
 
     update_download(ep_key, status="done", percent=100.0)
     return "downloaded"
@@ -582,7 +649,12 @@ _brocoflix_lock = threading.Lock()
 
 
 def brocoflix_start(body: dict) -> dict:
-    """Create a BrocoFlix download session. Returns session info."""
+    """Create a BrocoFlix download session. Returns session info.
+
+    Saves to the root staging dir with just the title (no year, no subfolders).
+    fix_file_names.py runs after mux to do OMDb lookup, add year, and move
+    into the correct folder structure.
+    """
     page_url = body.get("page_url", "")
     info = parse_episode_info(body, page_url)
 
@@ -590,27 +662,22 @@ def brocoflix_start(body: dict) -> dict:
     if not show_name:
         return {"status": "error", "message": "missing show_name"}
 
-    # OMDb lookup
-    meta = lookup_show(show_name)
-    if meta:
-        show_title = sanitize_for_windows(f"{meta['title']} ({meta['year']})")
-    else:
-        show_title = sanitize_for_windows(show_name)
+    show_title = sanitize_for_windows(show_name)
 
     season = info.get("season")
     episode = info.get("episode")
     is_movie = "type=movie" in page_url
 
     if is_movie or season is None or episode is None:
-        # Movie
+        # Movie → C:\Temp_Media\Movies\Title.mp4
         ep_tag = ""
         filename = f"{show_title}.mp4"
-        output_path = MOVIE_OUTPUT_DIR / show_title / filename
+        output_path = MOVIE_OUTPUT_DIR / filename
     else:
-        # TV episode
+        # TV episode → C:\Temp_Media\TV Shows\Title SxxExx.mp4
         ep_tag = f"S{season:02d}E{episode:02d}"
         filename = f"{show_title} {ep_tag}.mp4"
-        output_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / filename
+        output_path = OUTPUT_DIR / filename
 
     show_slug = info.get("show_slug", "")
     ep_key = f"{show_slug}|{season or 0}|{episode or 0}"
@@ -635,6 +702,7 @@ def brocoflix_start(body: dict) -> dict:
             "ep_tag": ep_tag,
             "season": season,
             "episode": episode,
+            "is_movie": is_movie or season is None or episode is None,
             "chunks_received": 0,
             "total_chunks": 0,
             "bytes_received": 0,
@@ -663,9 +731,8 @@ def brocoflix_start(body: dict) -> dict:
             "started": time.time(),
         }
 
-    omdb_note = "" if meta else " (OMDb miss)"
-    label = f"[{ep_tag}]" if ep_tag else f"[MOVIE]"
-    print(f"  {label} BrocoFlix session started — {show_title}{omdb_note}", flush=True)
+    label = f"[{ep_tag}]" if ep_tag else "[MOVIE]"
+    print(f"  {label} BrocoFlix session started — {show_title}", flush=True)
 
     return {
         "status": "ok",
@@ -692,26 +759,26 @@ def brocoflix_chunk(session_id: str, chunk_index: int, total_chunks: int,
         f.write(data)
 
     with _brocoflix_lock:
-        session["chunks_received"] = chunk_index + 1
+        session["chunks_received"] += 1
         session["total_chunks"] = total_chunks
         session["bytes_received"] += len(data)
         chunks_received = session["chunks_received"]
         bytes_received = session["bytes_received"]
 
     # Progress logging every 50 chunks + first + last
-    if chunk_index == 0 or (chunk_index + 1) % 50 == 0 or chunk_index + 1 == total_chunks:
+    if chunks_received == 1 or chunks_received % 50 == 0 or chunks_received == total_chunks:
         size_mb = bytes_received / (1024 * 1024)
         label = f"[{session.get('ep_tag', '')}]" if session.get("ep_tag") else "[MOVIE]"
         print(f"  {label} BrocoFlix chunk {chunks_received}/{total_chunks} "
               f"({size_mb:.1f}MB received)", flush=True)
 
     # Update download progress
-    pct = ((chunk_index + 1) / total_chunks * 100) if total_chunks > 0 else 0
+    pct = (chunks_received / total_chunks * 100) if total_chunks > 0 else 0
     size_mb = bytes_received / (1024 * 1024)
     update_download(ep_key,
                     status="uploading",
                     percent=round(pct, 1),
-                    frag=chunk_index + 1,
+                    frag=chunks_received,
                     total_frags=total_chunks,
                     size=f"{size_mb:.1f}MiB")
 
@@ -765,6 +832,29 @@ def brocoflix_done(session_id: str, dry_run: bool) -> dict:
             print(f"    | {line}", flush=True)
         update_download(ep_key, status="error")
         return {"status": "error", "message": "ffmpeg mux failed"}
+
+    # Fix broken encoder metadata (hls.js tags) before marking done
+    fix_metadata_for_jellyfin(output_path, label=label)
+
+    # Run fix_file_names.py to do OMDb lookup, add year, and move into
+    # the correct folder structure (Title (Year)/Season XX/ for TV,
+    # Title (Year)/ for movies).
+    fix_script = Path(__file__).resolve().parent / "fix_file_names.py"
+    if fix_script.exists():
+        print(f"  {label} Running fix_file_names.py...", flush=True)
+        try:
+            fix_proc = subprocess.run(
+                [sys.executable, str(fix_script)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if fix_proc.returncode == 0:
+                print(f"  {label} fix_file_names.py completed", flush=True)
+            else:
+                print(f"  {label} fix_file_names.py failed (exit {fix_proc.returncode})", flush=True)
+                for line in fix_proc.stderr.splitlines()[-5:]:
+                    print(f"    | {line}", flush=True)
+        except Exception as e:
+            print(f"  {label} fix_file_names.py error: {e}", flush=True)
 
     update_download(ep_key, status="done", percent=100.0)
     print(f"  {label} Done — {output_path}", flush=True)
@@ -978,9 +1068,14 @@ class HLSHandler(BaseHTTPRequestHandler):
             ep_tag = f"S{season:02d}E{episode:02d}"
             filename = f"{show_title} {ep_tag}.mp4"
 
-        # Probe available formats
-        formats = probe_formats(m3u8_url)
-        best_quality = get_best_format_label(formats)
+        # Use browser-provided quality if available (BrocoFlix CDN 403s yt-dlp)
+        browser_quality = body.get("quality")
+        if browser_quality:
+            best_quality = f"{browser_quality} mp4"
+            formats = []
+        else:
+            formats = probe_formats(m3u8_url)
+            best_quality = get_best_format_label(formats)
 
         self._send_json({
             "status": "ok",
