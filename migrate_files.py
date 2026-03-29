@@ -46,7 +46,7 @@ EXISTING_TV_DIRS = [
 ]
 
 # Movie destination
-NEW_MOVIE_DIR = r"F:\Movies"
+NEW_MOVIE_DIR = r"L:\Movies"
 
 
 # =========================

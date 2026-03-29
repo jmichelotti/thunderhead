@@ -38,6 +38,8 @@ USE_REMOTE_TITLE = True
 
 # ======== HELPERS ========
 
+IMDB_ID_RE = re.compile(r"(tt\d{7,8})", re.IGNORECASE)
+
 def sanitize_for_windows(name: str) -> str:
     """
     Sanitize a string so it is safe as a Windows file/folder name.
@@ -56,6 +58,43 @@ def sanitize_for_windows(name: str) -> str:
     name = name.rstrip(" .")
 
     return name
+
+
+def try_omdb_imdb_id(imdb_id: str) -> Optional[Dict[str, str]]:
+    """
+    Look up a movie by IMDb ID (i=).
+    """
+    params = {
+        "apikey": OMDB_API_KEY,
+        "i": imdb_id.lower(),
+        "type": "movie",
+    }
+
+    try:
+        resp = requests.get("https://www.omdbapi.com/", params=params, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        print(f"  [OMDb] IMDb lookup error: {e}")
+        return None
+
+    if data.get("Response") != "True":
+        print(f"  [OMDb] IMDb lookup failed: {data.get('Error')}")
+        return None
+
+    title = data.get("Title")
+    year = data.get("Year")
+
+    if not title or not year:
+        print("  [OMDb] Missing Title/Year in IMDb response.")
+        return None
+
+    year = "".join(ch for ch in year if ch.isdigit())[:4]
+    if len(year) != 4:
+        print(f"  [OMDb] Could not parse year from IMDb: {data.get('Year')}")
+        return None
+
+    print(f"  [OMDb] IMDb match: {title} ({year}) [{imdb_id}]")
+    return {"title": title, "year": year}
 
 
 def try_omdb_exact(title: str) -> Optional[Dict[str, str]]:
@@ -164,6 +203,15 @@ def lookup_movie_metadata(base_title: str) -> Optional[Dict[str, str]]:
     if not OMDB_API_KEY:
         print("  [OMDb] No API key configured; skipping lookup.")
         return None
+
+    # 0) IMDb ID lookup (highest priority)
+    m = IMDB_ID_RE.search(base_title)
+    if m:
+        meta = try_omdb_imdb_id(m.group(1))
+        if meta:
+            return meta
+        # Strip the ID from the title and fall through to title-based lookups
+        base_title = IMDB_ID_RE.sub("", base_title).strip()
 
     # 1) Exact match on full title
     meta = try_omdb_exact(base_title)
