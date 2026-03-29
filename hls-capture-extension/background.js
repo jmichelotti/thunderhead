@@ -639,10 +639,11 @@ function cleanupBrocoflixSession(sessionId) {
 // into the MAIN world. This uses a separate HTTP/2 socket pool, avoiding the
 // GOAWAY poisoning that causes permanent segment failures in iframe-based fetching.
 
-async function fetchSegmentManifest(m3u8Url) {
+async function fetchSegmentManifest(m3u8Url, extraHeaders) {
   const resp = await fetch(m3u8Url, {
     mode: "cors",
     credentials: "include",
+    headers: extraHeaders || {},
   });
   if (!resp.ok) throw new Error(`m3u8 fetch failed: ${resp.status}`);
   const manifest = await resp.text();
@@ -674,6 +675,7 @@ async function fetchSegmentManifest(m3u8Url) {
     const varResp = await fetch(variantUrl, {
       mode: "cors",
       credentials: "include",
+      headers: extraHeaders || {},
     });
     if (!varResp.ok) throw new Error(`Variant fetch failed: ${varResp.status}`);
     mediaManifest = await varResp.text();
@@ -708,9 +710,29 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
     return;
   }
 
-  // Determine embed origin from captured headers, or use known embed origins
+  // Determine embed origin from captured headers, or use known embed origins.
+  // Also build replayHeaders: all captured headers minus forbidden ones (Origin,
+  // Referer, Host, Connection handled by DNR or browser). FetchV replays ALL
+  // captured headers — this is the likely reason it hits 100% while we plateau
+  // at 99.4%. The CDN may apply stricter validation on segments with fake image
+  // extensions (.png, .ico, .webp, .jpg) that checks headers beyond Origin/Referer.
   const captured = capturedCdnHeaders.get(tabId);
   const embedOrigin = captured?.origin || "https://streameeeeee.site";
+  const FORBIDDEN_HEADERS = new Set([
+    "origin", "referer", "host", "connection", "content-length",
+    "accept-encoding", // let browser set its own (SW may not support same encodings)
+  ]);
+  const replayHeaders = {};
+  if (captured?.headers) {
+    for (const [name, value] of Object.entries(captured.headers)) {
+      if (!FORBIDDEN_HEADERS.has(name.toLowerCase())) {
+        replayHeaders[name] = value;
+      }
+    }
+    console.log(`[BF-sw] Replaying ${Object.keys(replayHeaders).length} captured headers: ${Object.keys(replayHeaders).join(", ")}`);
+  } else {
+    console.log(`[BF-sw] WARNING: No captured headers available — fetches will use bare defaults`);
+  }
   console.log(`[BF-sw] CDN domain: ${cdnDomain}, embed origin: ${embedOrigin}`);
 
   // Set declarativeNetRequest rules to spoof Origin and Referer on CDN requests.
@@ -745,7 +767,7 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
 
   let segments;
   try {
-    segments = await fetchSegmentManifest(m3u8Url);
+    segments = await fetchSegmentManifest(m3u8Url, replayHeaders);
   } catch (err) {
     console.log(`[BF-sw] Manifest fetch failed: ${err.message}`);
     console.log(`[BF-sw] Falling back to MAIN-world downloader`);
@@ -791,7 +813,8 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
   const failedThisCycle = [];
   const allCompleted = new Set(alreadyDone);
 
-  // Ordered send: buffer downloaded data and flush in order
+  // Ordered send: buffer downloaded data and flush in order.
+  // downloaded[i] = null (not yet attempted), false (failed/skip), or ArrayBuffer (ready to send)
   const downloaded = new Array(totalSegs).fill(null);
   let sendCursor = 0;
   while (sendCursor < totalSegs && alreadyDone.has(sendCursor)) sendCursor++;
@@ -799,7 +822,8 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
   async function flushToServer() {
     while (sendCursor < totalSegs) {
       if (alreadyDone.has(sendCursor)) { sendCursor++; continue; }
-      if (downloaded[sendCursor] === null) break;
+      if (downloaded[sendCursor] === false) { sendCursor++; continue; } // failed segment, skip
+      if (downloaded[sendCursor] === null) break; // not yet attempted, wait
       try {
         await fetch("http://localhost:9876/brocoflix-chunk", {
           method: "POST",
@@ -850,6 +874,7 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
         mode: "cors",
         credentials: "include",
         cache: "no-store",
+        headers: replayHeaders,
       });
       clearTimeout(timer);
       if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
@@ -870,6 +895,7 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
         console.log(`[BF-sw] Progress: ${allCompleted.size}/${totalSegs} done (cycle: ${segsFetchedThisCycle}, skipped: ${failedThisCycle.length})`);
       }
     } else {
+      downloaded[segIdx] = false; // mark as failed so flushToServer skips past it
       failedThisCycle.push(segIdx);
       consecutiveFails++;
 
@@ -1011,16 +1037,26 @@ function handleBrocoflixReload(sessionId, completedIndices, totalSegments, reaso
             if (window === window.top) return null;
             function tryClick() {
               const selectors = [
-                "#btn-play", ".play-button", ".jw-icon-display", ".vjs-big-play-button",
+                "#btn-play", "#pl_but", ".play-button", ".jw-icon-display", ".vjs-big-play-button",
                 "[aria-label='Play']", "button.player-btn", ".plyr__control--overlaid",
-                ".play-overlay", ".play_btn", "#play-btn",
+                ".play-overlay", ".play_btn", "#play-btn", ".fa-play",
               ];
               for (const sel of selectors) {
                 const el = document.querySelector(sel);
                 if (el) { el.click(); return sel; }
               }
+              // Try clicking the video element
               const video = document.querySelector("video");
-              if (video) { video.click(); return "video"; }
+              if (video) { video.click(); video.play().catch(() => {}); return "video"; }
+              // Last resort: find any button/div with a play SVG or play-related class
+              const allButtons = document.querySelectorAll("button, div[class*='play'], div[class*='Play'], svg");
+              for (const el of allButtons) {
+                const cls = (el.className || "").toString().toLowerCase();
+                if (cls.includes("play") || el.querySelector?.("path[d*='M']")) {
+                  el.click();
+                  return `fallback:${el.tagName}.${cls.slice(0, 30)}`;
+                }
+              }
               return null;
             }
             let clicked = tryClick();
@@ -1089,11 +1125,29 @@ function triggerAutoCaptureEpisodeDone(tabId, sessionId) {
 
 // Fallback: inject the old MAIN-world downloader (used if SW fetch fails)
 function injectMainWorldDownloader(sessionId, m3u8Url, tabId, frameId, completedIndices) {
+  // Build replay headers for the MAIN-world fetch (same approach as SW path).
+  // MAIN-world runs in the iframe origin so Origin/Referer are correct natively,
+  // but other headers (Accept, sec-fetch-*, sec-ch-ua-*) may differ from what
+  // the real HLS player sends. Replaying them makes our requests indistinguishable.
+  const captured = capturedCdnHeaders.get(tabId);
+  const FORBIDDEN_HEADERS = new Set([
+    "origin", "referer", "host", "connection", "content-length",
+    "accept-encoding",
+  ]);
+  const headersForMainWorld = {};
+  if (captured?.headers) {
+    for (const [name, value] of Object.entries(captured.headers)) {
+      if (!FORBIDDEN_HEADERS.has(name.toLowerCase())) {
+        headersForMainWorld[name] = value;
+      }
+    }
+    console.log(`[BF] Passing ${Object.keys(headersForMainWorld).length} replay headers to MAIN-world`);
+  }
   chrome.scripting.executeScript({
     target: { tabId, frameIds: [frameId] },
     world: "MAIN",
     func: brocoflixDownloaderFunc,
-    args: [m3u8Url, sessionId, completedIndices || [], BROCOFLIX_RELOAD_THRESHOLD],
+    args: [m3u8Url, sessionId, completedIndices || [], BROCOFLIX_RELOAD_THRESHOLD, headersForMainWorld],
   }).catch(err => {
     console.log(`[BF] MAIN-world injection failed: ${err.message}`);
   });
@@ -1215,8 +1269,9 @@ async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOp
 // to reload the iframe for a fresh CDN domain + connection pool. It also
 // proactively requests a reload every `reloadThreshold` segments to stay
 // under the GOAWAY limit.
-function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThreshold) {
+function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThreshold, replayHeaders) {
   const alreadyDone = new Set(completedIndices || []);
+  const extraHeaders = replayHeaders || {};
 
   async function blobToBase64(blob) {
     return new Promise((resolve) => {
@@ -1226,12 +1281,16 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
     });
   }
 
-  // Fetch with AbortController timeout
+  // Fetch with AbortController timeout + replayed HLS player headers
   async function fetchWithTimeout(url, timeoutMs = 30000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const resp = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        cache: "no-store",
+        headers: extraHeaders,
+      });
       clearTimeout(timer);
       return resp;
     } catch (err) {
@@ -1329,6 +1388,7 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
 
       // Server appends chunks in receive order, so we send in segment-index order.
       // Buffer downloaded data past any gap until the gap is filled.
+      // downloaded[i] = null (not yet attempted), false (failed/skip), or base64 string (ready to send)
       const downloaded = new Array(totalSegs).fill(null);
       let sendCursor = 0;
 
@@ -1343,7 +1403,8 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
             sendCursor++;
             continue;
           }
-          if (downloaded[sendCursor] === null) break;
+          if (downloaded[sendCursor] === false) { sendCursor++; continue; } // failed segment, skip
+          if (downloaded[sendCursor] === null) break; // not yet attempted, wait
           window.postMessage(
             {
               type: "hlsBrocoChunk",
@@ -1375,14 +1436,26 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
         }
 
         let ok = false;
-        try {
-          const segResp = await fetchWithTimeout(segments[segIdx]);
-          if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
-          const blob = await segResp.blob();
-          downloaded[segIdx] = await blobToBase64(blob);
-          ok = true;
-        } catch (err) {
-          relayLog(`[BF-dl] Segment ${segIdx} FAILED: ${err.message} — skipping`);
+        const INLINE_RETRIES = isRetryPass ? 1 : 3;
+        const RETRY_DELAYS = [2000, 5000, 10000];
+        for (let attempt = 0; attempt <= INLINE_RETRIES; attempt++) {
+          try {
+            const segResp = await fetchWithTimeout(segments[segIdx]);
+            if (!segResp.ok) throw new Error(`HTTP ${segResp.status}`);
+            const blob = await segResp.blob();
+            downloaded[segIdx] = await blobToBase64(blob);
+            ok = true;
+            if (attempt > 0) relayLog(`[BF-dl] Segment ${segIdx} recovered on retry ${attempt}`);
+            break;
+          } catch (err) {
+            if (attempt < INLINE_RETRIES) {
+              const delay = RETRY_DELAYS[attempt] || 10000;
+              relayLog(`[BF-dl] Segment ${segIdx} attempt ${attempt + 1} failed: ${err.message} — retrying in ${delay / 1000}s`);
+              await new Promise(r => setTimeout(r, delay));
+            } else {
+              relayLog(`[BF-dl] Segment ${segIdx} FAILED after ${attempt + 1} attempts: ${err.message} — skipping`);
+            }
+          }
         }
 
         if (ok) {
@@ -1395,6 +1468,7 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
             relayLog(`[BF-dl] Progress: ${allCompleted.size}/${totalSegs} done (cycle: ${segsFetchedThisCycle}, skipped: ${failedThisCycle.length})`);
           }
         } else {
+          downloaded[segIdx] = false; // mark as failed so flushToServer skips past it
           failedThisCycle.push(segIdx);
           consecutiveFails++;
 
