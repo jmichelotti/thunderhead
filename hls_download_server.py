@@ -18,6 +18,7 @@ Workflow:
 """
 
 import argparse
+import io
 import json
 import re
 import shutil
@@ -50,6 +51,63 @@ TEMP_DIR = Path(r"C:\Temp_Media\_hls_tmp")
 OMDB_API_KEY = "591dfd18"
 DEFAULT_PORT = 9876
 MAX_HEIGHT = 1080
+LOG_FILE = Path(__file__).parent / "hls_server.log"
+LOG_MAX_SIZE = 5 * 1024 * 1024  # 5 MB — truncate old entries when exceeded
+
+
+# ========= LOGGING =========
+
+class TeeWriter:
+    """Duplicates writes to both the original stream and a log file."""
+
+    def __init__(self, original, log_file_handle):
+        self._original = original
+        self._log = log_file_handle
+
+    def write(self, data):
+        if self._original:
+            try:
+                self._original.write(data)
+            except Exception:
+                pass
+        try:
+            self._log.write(data)
+            self._log.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        if self._original:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    # Let attribute lookups (fileno, encoding, etc.) fall through to original
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _setup_logging():
+    """Redirect stdout and stderr to tee into LOG_FILE."""
+    # Rotate if log is too big — keep the most recent half
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_SIZE:
+        data = LOG_FILE.read_bytes()
+        LOG_FILE.write_bytes(data[len(data) // 2:])
+
+    log_fh = open(LOG_FILE, "a", encoding="utf-8")
+    log_fh.write(f"\n{'='*60}\n")
+    log_fh.write(f"Server started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_fh.write(f"{'='*60}\n")
+    log_fh.flush()
+
+    sys.stdout = TeeWriter(sys.__stdout__, log_fh)
+    sys.stderr = TeeWriter(sys.__stderr__, log_fh)
+
 
 # ========= HELPERS =========
 
@@ -1302,6 +1360,8 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port to listen on (default: {DEFAULT_PORT})")
     args = parser.parse_args()
+
+    _setup_logging()
 
     HLSHandler.dry_run = not args.apply
 
