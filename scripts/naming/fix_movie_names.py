@@ -60,9 +60,34 @@ def sanitize_for_windows(name: str) -> str:
     return name
 
 
+def try_imdb_suggestion(imdb_id: str) -> Optional[Dict[str, str]]:
+    """
+    Fallback: query IMDb's suggestion API for title/year.
+    Used when OMDb hasn't indexed the title yet.
+    """
+    url = f"https://v3.sg.media-imdb.com/suggestion/t/{imdb_id}.json"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        print(f"  [IMDb] Suggestion API error: {e}")
+        return None
+
+    for item in data.get("d", []):
+        if item.get("id", "").lower() == imdb_id.lower():
+            title = item.get("l")
+            year = item.get("y")
+            if title and year:
+                print(f"  [IMDb] Suggestion API match: {title} ({year}) [{imdb_id}]")
+                return {"title": title, "year": str(year)}
+
+    print(f"  [IMDb] Suggestion API: no match for {imdb_id}")
+    return None
+
+
 def try_omdb_imdb_id(imdb_id: str) -> Optional[Dict[str, str]]:
     """
-    Look up a movie by IMDb ID (i=).
+    Look up a movie by IMDb ID (i=). Falls back to IMDb suggestion API.
     """
     params = {
         "apikey": OMDB_API_KEY,
@@ -75,23 +100,23 @@ def try_omdb_imdb_id(imdb_id: str) -> Optional[Dict[str, str]]:
         data = resp.json()
     except Exception as e:
         print(f"  [OMDb] IMDb lookup error: {e}")
-        return None
+        return try_imdb_suggestion(imdb_id)
 
     if data.get("Response") != "True":
         print(f"  [OMDb] IMDb lookup failed: {data.get('Error')}")
-        return None
+        return try_imdb_suggestion(imdb_id)
 
     title = data.get("Title")
     year = data.get("Year")
 
     if not title or not year:
         print("  [OMDb] Missing Title/Year in IMDb response.")
-        return None
+        return try_imdb_suggestion(imdb_id)
 
     year = "".join(ch for ch in year if ch.isdigit())[:4]
     if len(year) != 4:
         print(f"  [OMDb] Could not parse year from IMDb: {data.get('Year')}")
-        return None
+        return try_imdb_suggestion(imdb_id)
 
     print(f"  [OMDb] IMDb match: {title} ({year}) [{imdb_id}]")
     return {"title": title, "year": year}
