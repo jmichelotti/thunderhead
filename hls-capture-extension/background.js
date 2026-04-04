@@ -580,26 +580,33 @@ async function autoConfirmCapture(m3u8Url, pageUrl, tabId) {
   await sendToServer(capture);
   console.log(`[AC] autoConfirmCapture server responded ep=${ep} status=${capture.status}`);
 
-  // Wait a moment for any remaining subtitle requests to arrive at the server
-  // (subtitles load on page init but some may still be in-flight)
-  await new Promise((r) => setTimeout(r, 2000));
-
-  // Guard: only send done-signal if we're still on the same episode AND
-  // haven't already sent one for this episode.  Multiple m3u8 URLs per episode
-  // (ad pre-rolls, quality variants, CDN retries) each trigger this function,
-  // but only the first should fire the done-signal.  Without this guard, a
-  // stale done-signal from episode N can resolve episode N+1's
-  // waitForEpisodeDone, causing it to be skipped.
+  // Guard: only proceed if we're still on the same episode AND haven't already
+  // sent one for this episode.  Multiple m3u8 URLs per episode (ad pre-rolls,
+  // quality variants, CDN retries) each trigger this function, but only the
+  // first should fire the done-signal.
   if (epoch !== autoCapture.epoch || autoCapture.episodeDoneSent) {
     console.log(`[AC] autoConfirmCapture SUPPRESSED ep=${ep} snapshotEpoch=${epoch} currentEpoch=${autoCapture.epoch} doneSent=${autoCapture.episodeDoneSent}`);
     return;
   }
-  autoCapture.episodeDoneSent = true;
 
-  // Notify the content script that this episode is done
+  // Mark done IMMEDIATELY so the content script's checkEpisodeDone query sees
+  // it even during the subtitle grace period below.  Previously this was set
+  // after the 2s wait, causing a race: the content script loaded, queried
+  // checkEpisodeDone (got false), set up its resolver, but the done-signal
+  // had already been sent via notifyTab (lost because the listener wasn't
+  // ready yet) — resulting in every other episode being skipped.
+  autoCapture.episodeDoneSent = true;
   autoCapture.doneCount++;
   updateBadge();
+  console.log(`[AC] autoConfirmCapture MARKED DONE ep=${ep} epoch=${epoch}`);
 
+  // Wait a moment for any remaining subtitle requests to arrive at the server
+  // (subtitles load on page init but some may still be in-flight)
+  await new Promise((r) => setTimeout(r, 2000));
+
+  // Send the done-signal to the content script (may be a no-op if content
+  // script already resolved via checkEpisodeDone polling, but that's fine)
+  if (epoch !== autoCapture.epoch) return;  // advanced while we waited
   console.log(`[AC] autoConfirmCapture DONE-SIGNAL ep=${ep} epoch=${epoch}`);
   notifyTab(tabId, {
     type: "autoCaptureEpisodeDone",
@@ -1838,11 +1845,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     updateBadge();
     sendResponse({ ok: true });
   } else if (msg.type === "clearEpisodeState") {
-    // Clear seen m3u8s between episodes so the next capture is detected fresh
-    console.log(`[AC] clearEpisodeState (ep ${autoCapture.currentEp}, epoch ${autoCapture.epoch}, had ${seenM3u8.size} seen urls)`);
+    // Clear seen m3u8s between episodes so the next capture is detected fresh.
+    // NOTE: we intentionally do NOT reset episodeDoneSent here.  If the m3u8
+    // was already captured during page load (before the content script loaded),
+    // episodeDoneSent=true is the only record of that — resetting it caused
+    // the content script to miss the done-signal and skip the episode.
+    // Retries that need a fresh done-signal use "resetDoneSignal" instead.
+    console.log(`[AC] clearEpisodeState (ep ${autoCapture.currentEp}, epoch ${autoCapture.epoch}, had ${seenM3u8.size} seen urls, doneSent=${autoCapture.episodeDoneSent})`);
     seenM3u8.clear();
     subtitlesSent.clear();
-    autoCapture.episodeDoneSent = false;  // allow retry to receive a fresh done-signal
+    sendResponse({ ok: true });
+  } else if (msg.type === "checkEpisodeDone") {
+    // Content script asks whether the current episode's m3u8 was already captured
+    // (done-signal may have fired before the resolver was set up)
+    sendResponse({ done: autoCapture.episodeDoneSent });
+  } else if (msg.type === "resetDoneSignal") {
+    // Retries need episodeDoneSent cleared so a new capture can fire the done-signal
+    autoCapture.episodeDoneSent = false;
     sendResponse({ ok: true });
   } else if (msg.type === "autoCaptureEpisodesDiscovered") {
     // Content script discovered episode hashes from the DOM (hash-reload sites)

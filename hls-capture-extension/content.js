@@ -442,6 +442,8 @@ async function runAutoCaptureClickCard(state) {
     const retryLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
     showAutoCaptureOverlay(`Auto-capture: ${retryLabel} (retrying...)`);
     console.log(`[AC] EP ${currentEp}: retrying...`);
+    // Reset done-signal so the retry's m3u8 can trigger a fresh one
+    await sendMessageAsync({ type: "resetDoneSignal" });
     await sendMessageAsync({ type: "clearEpisodeState" });
     card.click();
     await sleep(800);
@@ -631,6 +633,18 @@ async function runAutoCaptureHashReload(state) {
   // Timeout = 4s sleep + 15s capture window.
   const capturePromise = waitForEpisodeDone(19000);
 
+  // Race condition fix: the m3u8 may have fired during page load (before this content
+  // script reached document_idle).  autoConfirmCapture would have processed it and set
+  // episodeDoneSent=true, but the done-signal was lost because our message listener
+  // wasn't registered yet (or autoCaptureResolveEpisode was null).  Check now and
+  // resolve immediately if the capture already completed.
+  const doneCheck = await sendMessageAsync({ type: "checkEpisodeDone" });
+  if (doneCheck?.done && autoCaptureResolveEpisode) {
+    console.log(`[AC] EP ${currentEp}: already captured during page load (early resolve)`);
+    autoCaptureResolveEpisode(true);
+    autoCaptureResolveEpisode = null;
+  }
+
   // Wait for page and player to fully initialize (subtitles load during this time)
   await sleep(4000);
   if (autoCaptureAborted) return;
@@ -656,6 +670,9 @@ async function runAutoCaptureHashReload(state) {
   if (!captured) {
     const retryLabel = multiSeason ? `S${season} EP ${currentEp}` : `EP ${currentEp} of ${startEp}–${endEp}`;
     showAutoCaptureOverlay(`Auto-capture: ${retryLabel} (retrying...)`);
+    // Reset done-signal so the retry's m3u8 can trigger a fresh one
+    await sendMessageAsync({ type: "resetDoneSignal" });
+    await sendMessageAsync({ type: "clearEpisodeState" });
     playBtn = document.querySelector("#player button.player-btn");
     if (playBtn) playBtn.click();
 

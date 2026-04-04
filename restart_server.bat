@@ -11,6 +11,11 @@ for /f "tokens=2" %%p in ('wmic process where "CommandLine like '%%hls_download_
     taskkill /F /PID %%p >nul 2>&1
 )
 
+:: Fallback: kill anything holding port 9876 (in case wmic missed it)
+for /f "tokens=5" %%p in ('netstat -aon ^| findstr ":9876.*LISTENING" 2^>nul') do (
+    taskkill /F /PID %%p >nul 2>&1
+)
+
 timeout /t 1 /nobreak >nul
 
 echo Starting HLS Download Server (background, --apply)...

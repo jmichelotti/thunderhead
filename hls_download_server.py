@@ -1006,7 +1006,7 @@ class HLSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         msg = format % args
         # Suppress noisy/redundant HTTP request logs
-        if any(s in msg for s in ("GET /status", "GET /downloads",
+        if any(s in msg for s in ("GET /status", "GET /downloads", "GET /clear",
                                    "POST /capture", "POST /subtitle",
                                    "POST /preview", "POST /season-info",
                                    "POST /brocoflix-", "OPTIONS")):
@@ -1037,6 +1037,12 @@ class HLSHandler(BaseHTTPRequestHandler):
         elif self.path == "/downloads":
             with _downloads_lock:
                 self._send_json({"downloads": list(_downloads.values())})
+        elif self.path == "/clear":
+            with _downloads_lock:
+                _downloads.clear()
+            with HLSHandler._lock:
+                HLSHandler.seen_urls.clear()
+            self._send_json({"status": "ok"})
         else:
             self._send_json({"error": "not found"}, 404)
 
