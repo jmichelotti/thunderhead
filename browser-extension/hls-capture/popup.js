@@ -115,6 +115,8 @@ function renderDownloads(downloads) {
       const statusLabel = {
         queued: "queued",
         downloading: "downloading",
+        uploading: "uploading",
+        muxing: "muxing",
         moving: "moving file",
         done: "complete",
         error: "failed",
@@ -167,9 +169,11 @@ function refresh() {
 }
 
 document.getElementById("clearBtn").addEventListener("click", () => {
+  // Clear both extension state and server download history
   chrome.runtime.sendMessage({ type: "clearCaptures" }, () => {
     refresh();
   });
+  fetch(`${SERVER_BASE}/clear`, { signal: AbortSignal.timeout(2000) }).catch(() => {});
 });
 
 // --- Auto-capture controls ---

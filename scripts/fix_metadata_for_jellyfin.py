@@ -19,11 +19,11 @@ VERBOSE = True
 ENCODER_PATTERNS = ["hls.js", "dailymotion"]
 
 # Supported input containers
-VIDEO_EXTS = {".mp4", ".mkv", ".avi"}
+VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov"}
 
 # Codecs safe for remux into MP4
-SAFE_VIDEO_CODECS = {"h264"}
-SAFE_AUDIO_CODECS = {"aac", "mp3", "ac3"}
+SAFE_VIDEO_CODECS = {"h264", "hevc", "mpeg4"}
+SAFE_AUDIO_CODECS = {"aac", "mp3", "ac3", "eac3", "opus"}
 
 # ============================================================
 
@@ -97,6 +97,7 @@ def remux_to_mp4(src: Path, dest: Path, dry_run: bool):
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
+        "-map", "0",
         "-c", "copy",
         "-movflags", "+faststart",
         str(dest),
@@ -118,21 +119,44 @@ def reencode_to_mp4(src: Path, dest: Path, dry_run: bool):
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
+    # Try QSV hardware encoding first (Intel Iris Xe), fall back to software
+    qsv_cmd = [
         "ffmpeg", "-y",
+        "-hwaccel", "qsv",
+        "-hwaccel_output_format", "qsv",
         "-i", str(src),
         "-map", "0",
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "18",
+        "-c:v", "h264_qsv",
+        "-global_quality", "23",
         "-c:a", "aac",
+        "-c:s", "copy",
         "-movflags", "+faststart",
         str(dest),
     ]
 
-    print(f"[FFMPEG] Re-encoding:\n  {src}\n  -> {dest}")
+    sw_cmd = [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-map", "0",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-c:s", "copy",
+        "-movflags", "+faststart",
+        str(dest),
+    ]
+
+    print(f"[FFMPEG] Re-encoding (QSV):\n  {src}\n  -> {dest}")
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(qsv_cmd, check=True)
+        return True
+    except subprocess.CalledProcessError:
+        print(f"[QSV FAILED] Falling back to software encode: {src}")
+
+    print(f"[FFMPEG] Re-encoding (software):\n  {src}\n  -> {dest}")
+    try:
+        subprocess.run(sw_cmd, check=True)
         return True
     except subprocess.CalledProcessError as e:
         print(f"[ffmpeg ERROR] {src}: {e}", file=sys.stderr)
@@ -149,16 +173,18 @@ def process_file(path: Path, dry_run: bool):
 
     final_mp4 = path.with_suffix(".mp4")
     tmp_out = final_mp4.with_suffix(".tmp.mp4")
+    success = False
 
-    # --- AVI handling ---
-    if ext == ".avi":
+    # --- AVI / MOV handling ---
+    if ext in (".avi", ".mov"):
         can_remux = vcodec in SAFE_VIDEO_CODECS and acodec in SAFE_AUDIO_CODECS
 
+        label = ext.lstrip(".").upper()
         if can_remux:
-            print(f"[AVI -> REMUX] {path} (v={vcodec}, a={acodec})")
+            print(f"[{label} -> REMUX] {path} (v={vcodec}, a={acodec})")
             success = remux_to_mp4(path, tmp_out, dry_run)
         else:
-            print(f"[AVI -> REENCODE] {path} (v={vcodec}, a={acodec})")
+            print(f"[{label} -> REENCODE] {path} (v={vcodec}, a={acodec})")
             success = reencode_to_mp4(path, tmp_out, dry_run)
 
     # --- MP4 handling only ---
@@ -206,16 +232,16 @@ def find_video_files(root: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fix AVI / MP4 / MKV files for Jellyfin (AVI-aware)."
+        description="Fix video files for Jellyfin (QSV hardware encoding, multi-container)."
     )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
 
     dry_run = not args.apply
 
-    print("=== Jellyfin Video Fixer (AVI-aware) ===")
+    print("=== Jellyfin Video Fixer (QSV + multi-container) ===")
     print(f"DRY_RUN={dry_run}")
-    print("=======================================\n")
+    print("===================================================\n")
 
     for root in map(Path, FOLDERS_TO_SCAN):
         if not root.exists():

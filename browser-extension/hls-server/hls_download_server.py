@@ -18,6 +18,7 @@ Workflow:
 """
 
 import argparse
+import io
 import json
 import re
 import shutil
@@ -50,6 +51,63 @@ TEMP_DIR = Path(r"C:\Temp_Media\_hls_tmp")
 OMDB_API_KEY = "591dfd18"
 DEFAULT_PORT = 9876
 MAX_HEIGHT = 1080
+LOG_FILE = Path(__file__).parent / "hls_server.log"
+LOG_MAX_SIZE = 5 * 1024 * 1024  # 5 MB — truncate old entries when exceeded
+
+
+# ========= LOGGING =========
+
+class TeeWriter:
+    """Duplicates writes to both the original stream and a log file."""
+
+    def __init__(self, original, log_file_handle):
+        self._original = original
+        self._log = log_file_handle
+
+    def write(self, data):
+        if self._original:
+            try:
+                self._original.write(data)
+            except Exception:
+                pass
+        try:
+            self._log.write(data)
+            self._log.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        if self._original:
+            try:
+                self._original.flush()
+            except Exception:
+                pass
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    # Let attribute lookups (fileno, encoding, etc.) fall through to original
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def _setup_logging():
+    """Redirect stdout and stderr to tee into LOG_FILE."""
+    # Rotate if log is too big — keep the most recent half
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_SIZE:
+        data = LOG_FILE.read_bytes()
+        LOG_FILE.write_bytes(data[len(data) // 2:])
+
+    log_fh = open(LOG_FILE, "a", encoding="utf-8")
+    log_fh.write(f"\n{'='*60}\n")
+    log_fh.write(f"Server started at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_fh.write(f"{'='*60}\n")
+    log_fh.flush()
+
+    sys.stdout = TeeWriter(sys.__stdout__, log_fh)
+    sys.stderr = TeeWriter(sys.__stderr__, log_fh)
+
 
 # ========= HELPERS =========
 
@@ -122,13 +180,23 @@ def parse_show_from_url(page_url: str) -> dict:
     Expected URL patterns:
         https://1movies.bz/tv-the-pitt-4vevg#ep=1,5
         https://1movies.bz/tv-show-name-xxxxx#ep=<season>,<episode>
+        https://1moviesz.to/watch/movie-dead-poets-society-rylnp#ep=1
 
-    Returns: {show_slug, show_name, season, episode} or partial dict.
+    Returns: {show_slug, show_name, season, episode, is_movie} or partial dict.
     """
-    result = {"show_slug": "", "show_name": "", "season": None, "episode": None}
+    result = {"show_slug": "", "show_name": "", "season": None, "episode": None, "is_movie": False}
 
     parsed = urlparse(page_url)
     path = parsed.path.strip("/")
+
+    # Check for movie URL: "watch/movie-dead-poets-society-rylnp" or "movie-name-xxxxx"
+    movie_match = re.search(r"movie-(.+?)(?:-[a-z0-9]{4,6})?$", path, re.IGNORECASE)
+    if movie_match:
+        slug = movie_match.group(1)
+        result["show_slug"] = slug
+        result["show_name"] = slug.replace("-", " ").title()
+        result["is_movie"] = True
+        return result
 
     # Extract show slug from path: "watch/tv-the-pitt-4vevg" or "tv-the-pitt-4vevg"
     slug_match = re.search(r"tv-(.+?)(?:-[a-z0-9]{4,6})?$", path, re.IGNORECASE)
@@ -156,7 +224,7 @@ def parse_episode_info(body: dict, page_url: str) -> dict:
     for DOM-based sites like brocoflix.xyz where the URL never changes.
     Falls back to URL parsing for URL-based sites like 1movies.bz.
 
-    Returns: {show_slug, show_name, season, episode}
+    Returns: {show_slug, show_name, season, episode, is_movie}
     """
     show_name = (body.get("show_name") or "").strip()
     season = body.get("season")
@@ -169,17 +237,19 @@ def parse_episode_info(body: dict, page_url: str) -> dict:
             episode = int(episode)
             show_slug = re.sub(r"[^a-z0-9]+", "-", show_name.lower()).strip("-")
             return {"show_slug": show_slug, "show_name": show_name,
-                    "season": season, "episode": episode}
+                    "season": season, "episode": episode, "is_movie": False}
         except (ValueError, TypeError):
             pass
 
     # Fall back to URL parsing (1movies.bz slug format)
     url_info = parse_show_from_url(page_url)
+    is_movie = url_info.get("is_movie", False) or "type=movie" in page_url
     return {
         "show_slug": url_info.get("show_slug", ""),
         "show_name": show_name or url_info.get("show_name", ""),
         "season":    season  if season  is not None else url_info.get("season"),
         "episode":   episode if episode is not None else url_info.get("episode"),
+        "is_movie":  is_movie,
     }
 
 
@@ -213,6 +283,70 @@ def update_download(ep_key: str, **kwargs):
             _downloads[ep_key].update(kwargs)
 
 
+def fix_metadata_for_jellyfin(mp4_path: Path, label: str = "") -> bool:
+    """Remux an MP4 to fix broken encoder metadata (hls.js / dailymotion tags).
+
+    Rewrites the file in-place using stream-copy (no re-encode, near-instant).
+    Returns True if the file was fixed (or was already fine), False on error.
+    """
+    ENCODER_PATTERNS = ["hls.js", "dailymotion"]
+
+    # Probe the file for encoder tags
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        str(mp4_path),
+    ]
+    try:
+        result = subprocess.run(
+            probe_cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        )
+        info = json.loads(result.stdout)
+    except Exception as e:
+        print(f"  {label} [metadata fix] ffprobe failed: {e}", flush=True)
+        return True  # non-fatal, skip fix
+
+    # Check format-level and stream-level encoder tags
+    needs_fix = False
+    for tags_source in [info.get("format", {})] + info.get("streams", []):
+        enc = (tags_source.get("tags", {}) or {}).get("encoder", "").lower()
+        if any(p in enc for p in ENCODER_PATTERNS):
+            needs_fix = True
+            break
+
+    if not needs_fix:
+        return True
+
+    # Remux in-place: copy to temp, replace original
+    tmp_path = mp4_path.with_suffix(".fixing.mp4")
+    remux_cmd = [
+        "ffmpeg", "-y",
+        "-i", str(mp4_path),
+        "-map", "0",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(tmp_path),
+    ]
+    print(f"  {label} [metadata fix] Remuxing to strip bad encoder tags...", flush=True)
+    try:
+        proc = subprocess.run(remux_cmd, capture_output=True, text=True, timeout=300)
+        if proc.returncode != 0:
+            print(f"  {label} [metadata fix] ffmpeg failed (exit {proc.returncode})", flush=True)
+            tmp_path.unlink(missing_ok=True)
+            return False
+        # Replace original with fixed file
+        mp4_path.unlink()
+        tmp_path.rename(mp4_path)
+        print(f"  {label} [metadata fix] Done — bad encoder tags stripped", flush=True)
+        return True
+    except Exception as e:
+        print(f"  {label} [metadata fix] Error: {e}", flush=True)
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
 def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) -> str:
     """Download an m3u8 stream using yt-dlp. Returns status message."""
     if dry_run:
@@ -244,8 +378,12 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
         text=True, bufsize=1
     )
 
+    # Collect all output lines for diagnostics on failure
+    all_output = []
+
     for line in proc.stdout:
         line = line.rstrip()
+        all_output.append(line)
 
         # Parse quality format
         m = _QUALITY_RE.search(line)
@@ -278,6 +416,10 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
 
     if proc.returncode != 0:
         update_download(ep_key, status="error")
+        # Dump full yt-dlp output for diagnosis
+        print(f"  [{ep_key}] yt-dlp FAILED (exit {proc.returncode}) — full output:", flush=True)
+        for out_line in all_output:
+            print(f"    | {out_line}", flush=True)
         return f"yt-dlp failed (exit {proc.returncode})"
 
     # Move from temp to final location (video + any subtitle files)
@@ -293,6 +435,9 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
             continue
         sub_dest = output_path.parent / sub_file.name
         shutil.move(str(sub_file), str(sub_dest))
+
+    # Fix broken encoder metadata (hls.js tags) before marking done
+    fix_metadata_for_jellyfin(output_path, label=f"[{ep_key}]")
 
     update_download(ep_key, status="done", percent=100.0)
     return "downloaded"
@@ -498,9 +643,15 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         return
 
     show_title, season, episode = episode_info
-    ep_tag = f"S{season:02d}E{episode:02d}"
-    srt_name = f"{show_title} {ep_tag}.srt"
-    srt_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / srt_name
+    if season is None or episode is None:
+        # Movie
+        ep_tag = "Movie"
+        srt_name = f"{show_title}.srt"
+        srt_path = MOVIE_OUTPUT_DIR / show_title / srt_name
+    else:
+        ep_tag = f"S{season:02d}E{episode:02d}"
+        srt_name = f"{show_title} {ep_tag}.srt"
+        srt_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / srt_name
 
     # Check if subtitle already saved (file on disk or claimed by another thread)
     with _saved_subs_lock:
@@ -545,6 +696,238 @@ def process_pending_subs(ep_key: str):
 
     for url in urls:
         download_subtitle(url, ep_key)
+
+
+# ========= BROCOFLIX SESSION MANAGEMENT =========
+
+MOVIE_OUTPUT_DIR = Path(r"C:\Temp_Media\Movies")
+
+_brocoflix_sessions: Dict[str, dict] = {}
+_brocoflix_lock = threading.Lock()
+
+
+def brocoflix_start(body: dict) -> dict:
+    """Create a BrocoFlix download session. Returns session info.
+
+    Saves to the root staging dir with just the title (no year, no subfolders).
+    fix_file_names.py runs after mux to do OMDb lookup, add year, and move
+    into the correct folder structure.
+    """
+    page_url = body.get("page_url", "")
+    info = parse_episode_info(body, page_url)
+
+    show_name = info.get("show_name", "").strip()
+    if not show_name:
+        return {"status": "error", "message": "missing show_name"}
+
+    show_title = sanitize_for_windows(show_name)
+
+    season = info.get("season")
+    episode = info.get("episode")
+    is_movie = "type=movie" in page_url
+
+    if is_movie or season is None or episode is None:
+        # Movie → C:\Temp_Media\Movies\Title.mp4
+        ep_tag = ""
+        filename = f"{show_title}.mp4"
+        output_path = MOVIE_OUTPUT_DIR / filename
+    else:
+        # TV episode → C:\Temp_Media\TV Shows\Title SxxExx.mp4
+        ep_tag = f"S{season:02d}E{episode:02d}"
+        filename = f"{show_title} {ep_tag}.mp4"
+        output_path = OUTPUT_DIR / filename
+
+    show_slug = info.get("show_slug", "")
+    ep_key = f"{show_slug}|{season or 0}|{episode or 0}"
+
+    # Deduplicate
+    with HLSHandler._lock:
+        if ep_key in HLSHandler.seen_urls:
+            return {"status": "skipped", "message": "duplicate episode"}
+        HLSHandler.seen_urls.add(ep_key)
+
+    session_id = f"bf_{int(time.time() * 1000)}_{id(body) & 0xFFFF:04x}"
+    temp_path = TEMP_DIR / f"{session_id}.ts"
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    with _brocoflix_lock:
+        _brocoflix_sessions[session_id] = {
+            "temp_path": temp_path,
+            "output_path": output_path,
+            "ep_key": ep_key,
+            "filename": filename,
+            "show_title": show_title,
+            "ep_tag": ep_tag,
+            "season": season,
+            "episode": episode,
+            "is_movie": is_movie or season is None or episode is None,
+            "chunks_received": 0,
+            "total_chunks": 0,
+            "bytes_received": 0,
+        }
+
+    # Register resolved episode for subtitle matching
+    if season is not None and episode is not None:
+        with _resolved_lock:
+            _resolved_episodes[ep_key] = (show_title, season, episode)
+
+    # Register in downloads tracker
+    with _downloads_lock:
+        _downloads[ep_key] = {
+            "ep_key": ep_key,
+            "filename": filename,
+            "show": show_title,
+            "ep_tag": ep_tag,
+            "status": "uploading",
+            "percent": 0.0,
+            "speed": "",
+            "eta": "",
+            "frag": 0,
+            "total_frags": 0,
+            "quality": "",
+            "size": "",
+            "started": time.time(),
+        }
+
+    label = f"[{ep_tag}]" if ep_tag else "[MOVIE]"
+    print(f"  {label} BrocoFlix session started — {show_title}", flush=True)
+
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        "ep_key": ep_key,
+        "filename": filename,
+        "show_title": show_title,
+    }
+
+
+def brocoflix_chunk(session_id: str, chunk_index: int, total_chunks: int,
+                    data: bytes) -> dict:
+    """Append a TS chunk to the session's temp file."""
+    with _brocoflix_lock:
+        session = _brocoflix_sessions.get(session_id)
+        if not session:
+            return {"status": "error", "message": "unknown session"}
+
+    temp_path = session["temp_path"]
+    ep_key = session["ep_key"]
+
+    # Append binary data to temp .ts file
+    with open(temp_path, "ab") as f:
+        f.write(data)
+
+    with _brocoflix_lock:
+        session["chunks_received"] += 1
+        session["total_chunks"] = total_chunks
+        session["bytes_received"] += len(data)
+        chunks_received = session["chunks_received"]
+        bytes_received = session["bytes_received"]
+
+    # Progress logging every 50 chunks + first + last
+    if chunks_received == 1 or chunks_received % 50 == 0 or chunks_received == total_chunks:
+        size_mb = bytes_received / (1024 * 1024)
+        label = f"[{session.get('ep_tag', '')}]" if session.get("ep_tag") else "[MOVIE]"
+        print(f"  {label} BrocoFlix chunk {chunks_received}/{total_chunks} "
+              f"({size_mb:.1f}MB received)", flush=True)
+
+    # Update download progress
+    pct = (chunks_received / total_chunks * 100) if total_chunks > 0 else 0
+    size_mb = bytes_received / (1024 * 1024)
+    update_download(ep_key,
+                    status="uploading",
+                    percent=round(pct, 1),
+                    frag=chunks_received,
+                    total_frags=total_chunks,
+                    size=f"{size_mb:.1f}MiB")
+
+    return {"status": "ok"}
+
+
+def brocoflix_done(session_id: str, dry_run: bool) -> dict:
+    """Mux the collected TS chunks into an MP4 and move to output dir."""
+    with _brocoflix_lock:
+        session = _brocoflix_sessions.pop(session_id, None)
+        if not session:
+            return {"status": "error", "message": "unknown session"}
+
+    temp_path: Path = session["temp_path"]
+    output_path: Path = session["output_path"]
+    ep_key = session["ep_key"]
+    label = f"[{session['ep_tag']}]" if session["ep_tag"] else "[MOVIE]"
+
+    if not temp_path.exists():
+        update_download(ep_key, status="error")
+        return {"status": "error", "message": "temp file missing"}
+
+    size_mb = temp_path.stat().st_size / (1024 * 1024)
+    print(f"  {label} BrocoFlix upload complete — {session['chunks_received']} chunks, "
+          f"{size_mb:.1f}MB", flush=True)
+
+    if dry_run:
+        temp_path.unlink(missing_ok=True)
+        update_download(ep_key, status="dry_run", percent=100.0)
+        return {"status": "ok", "message": f"[DRY RUN] Would save to {output_path}"}
+
+    # Mux TS -> MP4 with ffmpeg
+    update_download(ep_key, status="muxing", percent=100.0)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(temp_path),
+        "-c", "copy",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    print(f"  {label} Muxing TS -> MP4...", flush=True)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    temp_path.unlink(missing_ok=True)
+
+    if proc.returncode != 0:
+        print(f"  {label} ffmpeg FAILED (exit {proc.returncode}):", flush=True)
+        for line in proc.stderr.splitlines()[-10:]:
+            print(f"    | {line}", flush=True)
+        update_download(ep_key, status="error")
+        return {"status": "error", "message": "ffmpeg mux failed"}
+
+    # Fix broken encoder metadata (hls.js tags) before marking done
+    fix_metadata_for_jellyfin(output_path, label=label)
+
+    # Run fix_file_names.py to do OMDb lookup, add year, and move into
+    # the correct folder structure (Title (Year)/Season XX/ for TV,
+    # Title (Year)/ for movies).
+    fix_script = Path(__file__).resolve().parent / "fix_file_names.py"
+    if fix_script.exists():
+        print(f"  {label} Running fix_file_names.py...", flush=True)
+        try:
+            fix_proc = subprocess.run(
+                [sys.executable, str(fix_script)],
+                capture_output=True, text=True, timeout=120,
+            )
+            if fix_proc.returncode == 0:
+                print(f"  {label} fix_file_names.py completed", flush=True)
+            else:
+                print(f"  {label} fix_file_names.py failed (exit {fix_proc.returncode})", flush=True)
+                for line in fix_proc.stderr.splitlines()[-5:]:
+                    print(f"    | {line}", flush=True)
+        except Exception as e:
+            print(f"  {label} fix_file_names.py error: {e}", flush=True)
+
+    update_download(ep_key, status="done", percent=100.0)
+    print(f"  {label} Done — {output_path}", flush=True)
+    return {"status": "ok", "filename": session["filename"]}
+
+
+def brocoflix_abort(session_id: str) -> dict:
+    """Clean up a failed BrocoFlix session."""
+    with _brocoflix_lock:
+        session = _brocoflix_sessions.pop(session_id, None)
+    if session:
+        temp_path: Path = session["temp_path"]
+        temp_path.unlink(missing_ok=True)
+        update_download(session["ep_key"], status="error")
+    return {"status": "ok"}
 
 
 # ========= HTTP SERVER =========
@@ -623,10 +1006,10 @@ class HLSHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         msg = format % args
         # Suppress noisy/redundant HTTP request logs
-        if any(s in msg for s in ("GET /status", "GET /downloads",
+        if any(s in msg for s in ("GET /status", "GET /downloads", "GET /clear",
                                    "POST /capture", "POST /subtitle",
                                    "POST /preview", "POST /season-info",
-                                   "OPTIONS")):
+                                   "POST /brocoflix-", "OPTIONS")):
             return
         print(f"  [{self.client_address[0]}] {msg}", flush=True)
 
@@ -644,7 +1027,8 @@ class HLSHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, X-Session-Id, X-Chunk-Index, X-Total-Chunks")
         self.end_headers()
 
     def do_GET(self):
@@ -653,6 +1037,12 @@ class HLSHandler(BaseHTTPRequestHandler):
         elif self.path == "/downloads":
             with _downloads_lock:
                 self._send_json({"downloads": list(_downloads.values())})
+        elif self.path == "/clear":
+            with _downloads_lock:
+                _downloads.clear()
+            with HLSHandler._lock:
+                HLSHandler.seen_urls.clear()
+            self._send_json({"status": "ok"})
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -672,11 +1062,18 @@ class HLSHandler(BaseHTTPRequestHandler):
             return
 
         info = parse_episode_info(body, page_url)
-        if not info["show_slug"] or info["season"] is None or info["episode"] is None:
+        is_movie = info.get("is_movie", False)
+        if not info["show_slug"]:
+            self._send_json({"status": "skipped", "message": "cannot parse show"})
+            return
+        if not is_movie and (info["season"] is None or info["episode"] is None):
             self._send_json({"status": "skipped", "message": "cannot parse episode"})
             return
 
-        ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
+        if is_movie:
+            ep_key = f"{info['show_slug']}|movie"
+        else:
+            ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
 
         self._send_json({"status": "ok"})
 
@@ -703,7 +1100,16 @@ class HLSHandler(BaseHTTPRequestHandler):
 
         # Parse show info
         info = parse_episode_info(body, page_url)
-        if not info["show_name"] or info["season"] is None or info["episode"] is None:
+        is_movie = info.get("is_movie", False)
+
+        if not info["show_name"]:
+            self._send_json({
+                "status": "error",
+                "message": "Could not parse show name from page URL"
+            })
+            return
+
+        if not is_movie and (info["season"] is None or info["episode"] is None):
             self._send_json({
                 "status": "error",
                 "message": "Could not parse show/season/episode from page URL"
@@ -717,24 +1123,34 @@ class HLSHandler(BaseHTTPRequestHandler):
         else:
             show_title = sanitize_for_windows(info["show_name"])
 
-        season = info["season"]
-        episode = info["episode"]
-        ep_tag = f"S{season:02d}E{episode:02d}"
-        filename = f"{show_title} {ep_tag}.mp4"
+        if is_movie:
+            ep_tag = "Movie"
+            filename = f"{show_title}.mp4"
+        else:
+            season = info["season"]
+            episode = info["episode"]
+            ep_tag = f"S{season:02d}E{episode:02d}"
+            filename = f"{show_title} {ep_tag}.mp4"
 
-        # Probe available formats
-        formats = probe_formats(m3u8_url)
-        best_quality = get_best_format_label(formats)
+        # Use browser-provided quality if available (BrocoFlix CDN 403s yt-dlp)
+        browser_quality = body.get("quality")
+        if browser_quality:
+            best_quality = f"{browser_quality} mp4"
+            formats = []
+        else:
+            formats = probe_formats(m3u8_url)
+            best_quality = get_best_format_label(formats)
 
         self._send_json({
             "status": "ok",
             "show_title": show_title,
-            "season": season,
-            "episode": episode,
+            "season": info.get("season"),
+            "episode": info.get("episode"),
             "ep_tag": ep_tag,
             "filename": filename,
             "quality": best_quality,
             "formats": formats,
+            "is_movie": is_movie,
         })
 
     def _handle_season_info(self):
@@ -767,6 +1183,15 @@ class HLSHandler(BaseHTTPRequestHandler):
 
         self._send_json({"status": "ok"})
 
+    def _read_json(self):
+        """Read and parse JSON body. Returns dict or None on error."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send_json({"status": "error", "message": f"bad request: {e}"}, 400)
+            return None
+
     def do_POST(self):
         if self.path == "/subtitle":
             self._handle_subtitle()
@@ -776,6 +1201,44 @@ class HLSHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/season-info":
             self._handle_season_info()
+            return
+        if self.path == "/brocoflix-start":
+            body = self._read_json()
+            if body is None:
+                return
+            result = brocoflix_start(body)
+            self._send_json(result)
+            return
+        if self.path == "/brocoflix-chunk":
+            session_id = self.headers.get("X-Session-Id", "")
+            chunk_index = int(self.headers.get("X-Chunk-Index", "0"))
+            total_chunks = int(self.headers.get("X-Total-Chunks", "0"))
+            length = int(self.headers.get("Content-Length", 0))
+            data = self.rfile.read(length)  # raw binary
+            result = brocoflix_chunk(session_id, chunk_index, total_chunks, data)
+            self._send_json(result)
+            return
+        if self.path == "/brocoflix-done":
+            body = self._read_json()
+            if body is None:
+                return
+            result = brocoflix_done(body.get("session_id", ""), self.dry_run)
+            # Process any pending subtitles for this episode
+            with _brocoflix_lock:
+                session = _brocoflix_sessions.get(body.get("session_id", ""))
+            ep_key = body.get("ep_key", "")
+            if ep_key:
+                threading.Thread(
+                    target=process_pending_subs, args=(ep_key,), daemon=True
+                ).start()
+            self._send_json(result)
+            return
+        if self.path == "/brocoflix-abort":
+            body = self._read_json()
+            if body is None:
+                return
+            result = brocoflix_abort(body.get("session_id", ""))
+            self._send_json(result)
             return
         if self.path != "/capture":
             self._send_json({"error": "not found"}, 404)
@@ -798,14 +1261,25 @@ class HLSHandler(BaseHTTPRequestHandler):
         # Parse show info from body fields or page URL
         info = parse_episode_info(body, page_url)
 
-        if not info["show_name"] or info["season"] is None or info["episode"] is None:
+        is_movie = info.get("is_movie", False)
+
+        if not info["show_name"]:
+            msg = "Could not parse show name from page URL"
+            print(f"  ERROR: {msg} — {page_url}", flush=True)
+            self._send_json({"status": "error", "message": msg})
+            return
+
+        if not is_movie and (info["season"] is None or info["episode"] is None):
             msg = "Could not parse show/season/episode from page URL"
             print(f"  ERROR: {msg} — {page_url}", flush=True)
             self._send_json({"status": "error", "message": msg})
             return
 
         # Deduplicate by episode (not by m3u8 URL, since players request multiple variants)
-        ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
+        if is_movie:
+            ep_key = f"{info['show_slug']}|movie"
+        else:
+            ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
         with HLSHandler._lock:
             if ep_key in HLSHandler.seen_urls:
                 self._send_json({"status": "skipped", "message": "duplicate episode"})
@@ -819,18 +1293,30 @@ class HLSHandler(BaseHTTPRequestHandler):
         else:
             show_title = sanitize_for_windows(info["show_name"])
 
-        season = info["season"]
-        episode = info["episode"]
-        ep_tag = f"S{season:02d}E{episode:02d}"
-        filename = f"{show_title} {ep_tag}.mp4"
-        output_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / filename
+        if is_movie:
+            ep_tag = "Movie"
+            filename = f"{show_title}.mp4"
+            output_path = MOVIE_OUTPUT_DIR / show_title / filename
+        else:
+            season = info["season"]
+            episode = info["episode"]
+            ep_tag = f"S{season:02d}E{episode:02d}"
+            filename = f"{show_title} {ep_tag}.mp4"
+            output_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / filename
 
         omdb_note = "" if meta else " (OMDb miss)"
+        m3u8_domain = urlparse(m3u8_url).hostname or "unknown"
         print(f"  [{ep_tag}] Starting — {show_title}{omdb_note}", flush=True)
+        print(f"  [{ep_tag}] m3u8 domain: {m3u8_domain}", flush=True)
+        print(f"  [{ep_tag}] m3u8 URL: {m3u8_url[:200]}", flush=True)
+        print(f"  [{ep_tag}] page URL: {page_url}", flush=True)
 
         # Register resolved episode so subtitles know where to save
         with _resolved_lock:
-            _resolved_episodes[ep_key] = (show_title, season, episode)
+            if is_movie:
+                _resolved_episodes[ep_key] = (show_title, None, None)
+            else:
+                _resolved_episodes[ep_key] = (show_title, season, episode)
 
         # Process any subtitles that arrived before this video capture
         threading.Thread(
@@ -880,6 +1366,8 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port to listen on (default: {DEFAULT_PORT})")
     args = parser.parse_args()
+
+    _setup_logging()
 
     HLSHandler.dry_run = not args.apply
 

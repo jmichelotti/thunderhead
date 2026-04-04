@@ -1,3 +1,5 @@
 .claude/*
 __pycache__/
 debug_page.png
+hls_server.log
+jellyfin-transcoding-settings.pdf
