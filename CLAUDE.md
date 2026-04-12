@@ -17,7 +17,10 @@ thunderhead/
 │   ├── fix_metadata_for_jellyfin.py
 │   ├── migrate_files.py
 │   ├── download_youtube_jellyfin.py
-│   └── shift_subtitles.py
+│   ├── shift_subtitles.py
+│   ├── audit_jellyfin.py          3-tier library audit (structural, layout, decode)
+│   ├── run_audit.bat              wrapper for nightly Task Scheduler job
+│   └── audit_reports/             CSV reports, summary, deep-decode cache (gitignored)
 ├── browser-extension/
 │   ├── hls-capture/   background.js, content.js, popup.html, popup.js, manifest.json
 │   └── hls-server/    hls_download_server.py, read_server_log.py, *.bat files
@@ -35,7 +38,7 @@ thunderhead/
 ## Key Paths
 
 - **Staging area**: `C:\Temp_Media\` (TV Shows, Movies subdirs) — where scripts pick up and process files
-- **Final libraries**: `D:\TV Shows`, `F:\TV Shows`, `L:\TV Shows`, `F:\Movies`, `L:\Movies`
+- **Final libraries**: `D:\TV Shows`, `F:\TV Shows`, `L:\TV Shows`, `D:\Movies`, `F:\Movies`, `L:\Movies`
 - **HLS temp**: `C:\Temp_Media\_hls_tmp\`
 
 Hardcoded paths throughout the repo are intentional (personal machine config). Don't refactor them into shared config unless asked.

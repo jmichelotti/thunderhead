@@ -11,6 +11,7 @@ Personal tooling for managing and maintaining my **ThunderheadFlix** Jellyfin me
 - **`migrate_files.py`** — Move processed media from staging to library drives
 - **`download_youtube_jellyfin.py`** — Download YouTube videos via yt-dlp
 - **`shift_subtitles.py`** — Shift .srt subtitle timestamps forward or backward
+- **`audit_jellyfin.py`** — 3-tier library audit: structural (ffprobe), naming/layout, and deep decode sweep (`--deep`). Runs nightly at 2am via Task Scheduler.
 
 ## Browser Extension (`browser-extension/`)
 
