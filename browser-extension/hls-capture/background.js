@@ -1710,7 +1710,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ active: false });
     }
   } else if (msg.type === "autoCaptureAdvance") {
-    // Content script finished an episode, advance to next or complete
+    // Content script finished an episode, advance to next or complete.
+    // Only accept advances from the top frame — the content script is
+    // injected into every frame (for BrocoFlix chunk relay), and accepting
+    // iframe advances would double-increment currentEp and skip every
+    // other episode.
+    if (sender.frameId !== 0) {
+      console.log(`[AC] autoCaptureAdvance ignored from frameId=${sender.frameId}`);
+      sendResponse({ hasNext: false });
+      return;
+    }
     const skipped = msg.skipped === true;
 
     // Multi-season with unknown episode count (hash-reload): use consecutive

@@ -77,6 +77,7 @@ Key design decisions:
 - `episodeDoneSent` set immediately (not after 2s wait) to avoid race with content script polling
 - `consecutiveSkips`: 2 skips = season done (handles unknown episode counts)
 - DOM-based episode discovery: scans `a[href*="#ep="]` with poll-until-stable pattern
+- `IS_TOP_FRAME` gate: the auto-capture loop and `chrome.runtime.onMessage` listener run only in the top frame. Manifest has `all_frames: true` so the BrocoFlix chunk relay can run in the video iframe; without the gate every frame would react to `autoCaptureEpisodeDone` and send its own `autoCaptureAdvance`, double-incrementing `currentEp` and skipping every other episode. `background.js` also rejects `autoCaptureAdvance` with `sender.frameId !== 0` as a safety net.
 
 ## BrocoFlix Special Handling
 

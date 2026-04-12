@@ -3,6 +3,13 @@
 
 const DIALOG_ID = "hls-capture-dialog-container";
 
+// Manifest has all_frames: true so the BrocoFlix chunk relay (below) can run
+// inside the video iframe.  But the auto-capture loop and dialog UI must run
+// in the top frame only — otherwise each frame reacts to autoCaptureEpisodeDone
+// and sends its own autoCaptureAdvance, double-incrementing currentEp and
+// skipping every other episode.
+const IS_TOP_FRAME = window.top === window;
+
 function getOrCreateContainer() {
   let container = document.getElementById(DIALOG_ID);
   if (!container) {
@@ -876,8 +883,9 @@ function inspectPageDom() {
 
 // ========= INIT =========
 
-// Set up site-specific DOM listeners
-if (getCurrentSite() === "brocoflix.xyz") {
+// Set up site-specific DOM listeners (top frame only — iframes have a
+// different origin and no episode cards)
+if (IS_TOP_FRAME && getCurrentSite() === "brocoflix.xyz") {
   setupBrocoflixListeners();
 
   // Diagnostic: log BrocoFlix DOM state to service worker console
@@ -952,11 +960,14 @@ window.addEventListener("message", (e) => {
 });
 
 // On content script load, check if auto-capture is in progress for this tab
-checkAutoCaptureOnLoad();
+if (IS_TOP_FRAME) {
+  checkAutoCaptureOnLoad();
+}
 
 // ========= MESSAGE LISTENER =========
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!IS_TOP_FRAME) return;
   if (msg.type === "showCaptureDialog") {
     showDialog(msg);
     sendResponse({ ok: true });
