@@ -18,6 +18,7 @@ const views = {
   wrapped: renderWrapped,
   "now-watching": renderNowWatching,
   library: renderLibrary,
+  missing: renderMissing,
 };
 
 $$(".nav-btn").forEach((btn) =>
@@ -273,6 +274,69 @@ async function renderLibrary() {
   }
 
   html += "</table></div></div>";
+  $("#app").innerHTML = html;
+}
+
+// ── Missing Episodes ───────────────────────────────
+
+async function renderMissing() {
+  const gaps = await api("/episodes/gaps");
+
+  let html = "";
+
+  html += `
+    <div class="stats-row anim">
+      <div class="stat-card">
+        <div class="label">Shows With Gaps</div>
+        <div class="value">${gaps.shows_with_gaps}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Missing Episodes</div>
+        <div class="value">${num(gaps.total_missing_episodes)}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Last Scanned</div>
+        <div class="value" style="font-size:1.2rem">${fmtDate(gaps.generated_at)}</div>
+        <div class="sub">${new Date(gaps.generated_at).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}</div>
+      </div>
+    </div>`;
+
+  if (gaps.shows_with_gaps === 0) {
+    html += `
+      <div class="missing-clear anim">
+        <div class="missing-clear-title">All caught up</div>
+        <div class="missing-clear-sub">No missing episodes detected for any currently-watched shows.</div>
+      </div>`;
+    $("#app").innerHTML = html;
+    return;
+  }
+
+  html += '<div class="section anim"><div class="section-title">Episodes to Download</div>';
+  html += '<div class="section-sub">Aired episodes missing from Jellyfin for shows users are watching</div>';
+
+  for (const show of gaps.gaps) {
+    html += `<div class="missing-show anim">`;
+    html += `<div class="missing-show-header">`;
+    html += `<div>`;
+    html += `<div class="missing-show-name">${esc(show.show)}</div>`;
+    html += `<div class="missing-show-meta">${num(show.total_in_jellyfin)} episodes in library &middot; ${show.missing_episodes.length} missing</div>`;
+    html += `</div>`;
+    html += `<div class="missing-count">${show.missing_episodes.length}</div>`;
+    html += `</div>`;
+
+    html += `<div class="missing-episodes">`;
+    for (const ep of show.missing_episodes) {
+      html += `
+        <div class="missing-ep-row">
+          <span class="missing-ep-code">${esc(ep.code)}</span>
+          <span class="missing-ep-title">${esc(ep.title)}</span>
+          <span class="missing-ep-date">${fmtDate(ep.airdate)}</span>
+        </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  html += "</div>";
   $("#app").innerHTML = html;
 }
 

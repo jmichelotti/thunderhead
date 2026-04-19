@@ -681,6 +681,106 @@ main {
 
 .table-dim { color: var(--text-dim); font-style: italic; font-size: 0.8rem; }
 
+/* ── Missing Episodes ─────────────────────────────── */
+
+.missing-clear {
+  background: var(--surface);
+  border: 1px solid rgba(91, 184, 166, 0.2);
+  border-radius: 16px;
+  padding: 48px 32px;
+  text-align: center;
+}
+
+.missing-clear-title {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  color: var(--teal);
+  margin-bottom: 8px;
+}
+
+.missing-clear-sub {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.missing-show {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  margin-bottom: 16px;
+  transition: border-color 0.25s;
+}
+
+.missing-show:hover { border-color: var(--border-hi); }
+
+.missing-show-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.missing-show-name {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+}
+
+.missing-show-meta {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 3px;
+}
+
+.missing-count {
+  font-family: var(--font-display);
+  font-size: 1.8rem;
+  color: var(--rose);
+  line-height: 1;
+}
+
+.missing-episodes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.missing-ep-row {
+  display: flex;
+  align-items: baseline;
+  padding: 8px 0;
+  font-size: 0.84rem;
+}
+
+.missing-ep-row + .missing-ep-row {
+  border-top: 1px solid rgba(42, 37, 53, 0.5);
+}
+
+.missing-ep-code {
+  font-weight: 600;
+  color: var(--amber);
+  width: 72px;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.missing-ep-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.missing-ep-date {
+  color: var(--text-dim);
+  margin-left: 12px;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Responsive ────────────────────────────────────── */
 
 @media (max-width: 640px) {

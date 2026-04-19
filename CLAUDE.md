@@ -5,7 +5,7 @@ Personal tooling for managing a Jellyfin media server ("ThunderheadFlix"). Four 
 - **`scripts/`** — Python utilities for renaming, fixing metadata, migrating, and downloading media
 - **`browser-extension/`** — Chrome/Vivaldi extension + local Python server for capturing and downloading HLS streams
 - **`analytics/`** — FastAPI service (port 1201) exposing Jellyfin stats: live sessions, library counts, storage, and playback history via the Playback Reporting plugin
-- **`wrapped/`** — Static frontend served by the analytics service at `/wrapped/`, showing per-user viewing stats, currently-watching shows, and library overview
+- **`wrapped/`** — Static frontend served by the analytics service at `/wrapped/`, showing per-user viewing stats, currently-watching shows, library overview, and missing episode detection
 
 ## Repo Structure
 
@@ -35,9 +35,9 @@ thunderhead/
 │   ├── Dockerfile             Python 3.12-slim container for the analytics service
 │   ├── docker-compose.yml     container config: port 1201, restart unless-stopped
 │   ├── tracked_shows.json     cached show→TVmaze ID mappings (gitignored)
-│   └── requirements.txt       fastapi, uvicorn, httpx
+│   └── requirements.txt       fastapi, uvicorn, httpx, tzdata
 ├── wrapped/
-│   ├── index.html             dashboard shell (3 views: Wrapped, Watching, Library)
+│   ├── index.html             dashboard shell (4 views: Wrapped, Watching, Library, Missing)
 │   ├── styles.css             cinematic dark theme
 │   └── app.js                 vanilla JS SPA fetching from analytics API
 └── README.md

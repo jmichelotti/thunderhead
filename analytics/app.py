@@ -277,7 +277,7 @@ def root() -> dict:
             "/playback/wrapped?days=365",
             "/playback/history/{username}?days=365",
             "/playback/currently-watching?days=30",
-            "/episodes/gaps?days=30",
+            "/episodes/gaps?days=90",
         ]
     }
 
@@ -590,7 +590,7 @@ async def currently_watching(days: int = 30) -> dict:
 
 
 @app.get("/episodes/gaps")
-async def episodes_gaps(days: int = 30, all_seasons: bool = False) -> dict:
+async def episodes_gaps(days: int = 90, all_seasons: bool = False) -> dict:
     gaps = await episode_gaps.scan_gaps(days, recent_only=not all_seasons)
     total_missing = sum(len(g["missing_episodes"]) for g in gaps)
     return {

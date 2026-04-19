@@ -6,13 +6,24 @@ import json
 import logging
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import jellyfin_client as jf
 import tvmaze_client as tvmaze
+from config import TIMEZONE
 
 log = logging.getLogger("episode_gaps")
 
 CACHE_PATH = Path(__file__).resolve().parent / "tracked_shows.json"
+
+# TVmaze season + offset = Jellyfin season (e.g. AU Survivor 2016 reboot is -2)
+_SEASON_OFFSETS: dict[str, int] = {
+    "Australian Survivor": -2,
+}
+
+_IGNORE_SHOWS: set[str] = {
+    "SpongeBob SquarePants",
+}
 
 
 def _load_cache() -> dict:
@@ -60,7 +71,7 @@ async def _resolve_tvmaze_id(
     return None
 
 
-async def _get_watched_show_names(days: int = 30) -> set[str]:
+async def _get_watched_show_names(days: int = 90) -> set[str]:
     """Get unique show names from recent playback activity."""
     raw = await jf.custom_query(
         f"""
@@ -78,7 +89,7 @@ async def _get_watched_show_names(days: int = 30) -> set[str]:
     return {row[0] for row in raw.get("results", []) if row[0]}
 
 
-async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
+async def scan_gaps(days: int = 90, recent_only: bool = True) -> list[dict]:
     """
     Scan for missing episodes in shows users are actively watching.
 
@@ -86,7 +97,7 @@ async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
     (and the next one), which filters out old reunion/clip episodes
     you never intended to download.
     """
-    today = date.today()
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
     cache = _load_cache()
 
     # 1. Get shows users are watching
@@ -111,7 +122,8 @@ async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
     # 3. For each tracked show, resolve TVmaze ID and compare episodes
     results = []
     for name, entries in candidates.items():
-        # Resolve TVmaze ID from the first entry that has provider IDs
+        if name in _IGNORE_SHOWS:
+            continue
         series = entries[0]
         try:
             tvmaze_id = await _resolve_tvmaze_id(series, cache)
@@ -169,8 +181,8 @@ async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
                 # Check all seasons we have + next expected
                 jf_seasons.add(latest + 1)
 
-        # Find TVmaze episodes that have aired but aren't in Jellyfin
-        # Only check seasons we already have (or the next expected season)
+        offset = _SEASON_OFFSETS.get(name, 0)
+
         missing = []
         for ep in tvmaze_episodes:
             s_num = ep.get("season")
@@ -181,7 +193,9 @@ async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
                 continue
             if s_num == 0:
                 continue
-            if s_num not in jf_seasons:
+
+            jf_s = s_num + offset
+            if jf_s not in jf_seasons:
                 continue
 
             try:
@@ -192,11 +206,11 @@ async def scan_gaps(days: int = 30, recent_only: bool = True) -> list[dict]:
             if aired > today:
                 continue
 
-            if (s_num, e_num) not in jf_set:
+            if (jf_s, e_num) not in jf_set:
                 missing.append({
-                    "season": s_num,
+                    "season": jf_s,
                     "episode": e_num,
-                    "code": f"S{s_num:02d}E{e_num:02d}",
+                    "code": f"S{jf_s:02d}E{e_num:02d}",
                     "title": ep.get("name", ""),
                     "airdate": airdate,
                 })
