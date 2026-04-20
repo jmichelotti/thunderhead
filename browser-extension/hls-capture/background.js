@@ -629,7 +629,8 @@ let brocoflixPendingFrameId = null;
 //                          epKey, resolve: fn(m3u8Url, frameId) }
 const brocoflixReloadState = new Map();
 // Max segments to download before proactively reloading the iframe to avoid HTTP/2 GOAWAY
-const BROCOFLIX_RELOAD_THRESHOLD = 800;
+// Disabled: CDN no longer triggers GOAWAY, and the reload's auto-click is unreliable.
+const BROCOFLIX_RELOAD_THRESHOLD = 0;
 
 function cleanupBrocoflixSession(sessionId) {
   const session = brocoflixSessions.get(sessionId);
@@ -1358,6 +1359,7 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
   }
 
   async function run() {
+    let totalSegs = 0;
     try {
       // Pause the video player so it stops competing for CDN bandwidth.
       try {
@@ -1374,7 +1376,7 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
       const segments = await fetchManifestSegments();
       if (segments.length === 0) throw new Error("No segments found in m3u8");
 
-      const totalSegs = segments.length;
+      totalSegs = segments.length;
       const remaining = totalSegs - alreadyDone.size;
 
       // Retry pass: only fetch missing segments with longer delays between attempts
@@ -1520,10 +1522,21 @@ function brocoflixDownloaderFunc(m3u8Url, sessionId, completedIndices, reloadThr
       relayLog(`[BF-dl] All ${totalSegs} segments complete!`);
       window.postMessage({ type: "hlsBrocoDone", sessionId }, "*");
     } catch (err) {
-      window.postMessage(
-        { type: "hlsBrocoError", sessionId, error: err.message },
-        "*"
-      );
+      if (alreadyDone.size > 0) {
+        relayLog(`[BF-dl] Error with ${alreadyDone.size} segments completed: ${err.message}. Requesting reload...`);
+        window.postMessage({
+          type: "hlsBrocoNeedReload",
+          sessionId,
+          completedIndices: [...alreadyDone],
+          totalSegments: totalSegs || alreadyDone.size,
+          reason: "error_recovery",
+        }, "*");
+      } else {
+        window.postMessage(
+          { type: "hlsBrocoError", sessionId, error: err.message },
+          "*"
+        );
+      }
     }
   }
 

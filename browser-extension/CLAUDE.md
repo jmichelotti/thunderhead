@@ -86,6 +86,9 @@ CDN blocks all non-browser clients (403). Current approach (Phase 3):
 - `declarativeNetRequest` spoofs Origin/Referer headers at network stack level
 - Direct binary POST to server upload endpoints (no base64 overhead)
 - Separate socket pool eliminates HTTP/2 GOAWAY issues
+- Proactive reload disabled (`BROCOFLIX_RELOAD_THRESHOLD = 0`) — CDN no longer triggers GOAWAY
+- If >=99.5% segments complete and retries stall, muxes with gaps rather than aborting
+- MAIN-world catch routes errors through reload handler (not immediate abort) when segments exist
 
 See memory file `brocoflix-download-attempts.md` for full approach history and what's been tried.
 
