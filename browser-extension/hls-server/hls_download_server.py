@@ -302,6 +302,7 @@ def fix_metadata_for_jellyfin(mp4_path: Path, label: str = "") -> bool:
         result = subprocess.run(
             probe_cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         info = json.loads(result.stdout)
     except Exception as e:
@@ -331,7 +332,8 @@ def fix_metadata_for_jellyfin(mp4_path: Path, label: str = "") -> bool:
     ]
     print(f"  {label} [metadata fix] Remuxing to strip bad encoder tags...", flush=True)
     try:
-        proc = subprocess.run(remux_cmd, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(remux_cmd, capture_output=True, text=True, timeout=300,
+                              creationflags=subprocess.CREATE_NO_WINDOW)
         if proc.returncode != 0:
             print(f"  {label} [metadata fix] ffmpeg failed (exit {proc.returncode})", flush=True)
             tmp_path.unlink(missing_ok=True)
@@ -375,7 +377,7 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
 
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1
+        text=True, bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW
     )
 
     # Collect all output lines for diagnostics on failure
@@ -881,7 +883,8 @@ def brocoflix_done(session_id: str, dry_run: bool) -> dict:
     ]
     print(f"  {label} Muxing TS -> MP4...", flush=True)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                          creationflags=subprocess.CREATE_NO_WINDOW)
     temp_path.unlink(missing_ok=True)
 
     if proc.returncode != 0:
@@ -904,6 +907,7 @@ def brocoflix_done(session_id: str, dry_run: bool) -> dict:
             fix_proc = subprocess.run(
                 [sys.executable, str(fix_script)],
                 capture_output=True, text=True, timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if fix_proc.returncode == 0:
                 print(f"  {label} fix_file_names.py completed", flush=True)
@@ -949,7 +953,8 @@ def probe_formats(m3u8_url: str) -> list:
     cmd = ["yt-dlp", "-F", "--no-download", m3u8_url]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
+            cmd, capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         formats = []
         for line in result.stdout.splitlines():

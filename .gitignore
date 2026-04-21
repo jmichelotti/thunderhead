@@ -1,4 +1,5 @@
-.claude/*
+.claude/
+.playwright-mcp/
 __pycache__/
 debug_page.png
 hls_server.log
