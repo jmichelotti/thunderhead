@@ -21,9 +21,10 @@ thunderhead/
 │   ├── download_youtube_jellyfin.py
 │   ├── shift_subtitles.py
 │   ├── audit_jellyfin.py          3-tier library audit (structural, layout, decode)
+│   ├── bitrate_scan.py            lightweight ffprobe bitrate scan across all libraries
 │   ├── extract_subtitles.py       copy+rename standalone .srt files into staging
 │   ├── run_audit.bat              wrapper for nightly Task Scheduler job
-│   └── audit_reports/             CSV reports, summary, deep-decode cache (gitignored)
+│   └── audit_reports/             CSV reports, summary, issues .md, deep-decode cache (gitignored)
 ├── browser-extension/
 │   ├── hls-capture/   background.js, content.js, popup.html, popup.js, manifest.json
 │   └── hls-server/    hls_download_server.py, read_server_log.py, *.bat files

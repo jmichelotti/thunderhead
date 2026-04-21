@@ -105,7 +105,7 @@ def count_files_under(root: Path) -> int:
         return 0
     return sum(1 for p in root.rglob("*") if p.is_file())
 
-def merge_dirs(src_dir: Path, dst_dir: Path, dry_run: bool, verbose: bool) -> None:
+def merge_dirs(src_dir: Path, dst_dir: Path, dry_run: bool, verbose: bool, replace: bool = False) -> None:
     ensure_dir(dst_dir, dry_run, verbose)
 
     total_files = count_files_under(src_dir)
@@ -125,7 +125,14 @@ def merge_dirs(src_dir: Path, dst_dir: Path, dry_run: bool, verbose: bool) -> No
 
         final_dst = dst_path
         if final_dst.exists():
-            final_dst = unique_file_path(final_dst)
+            if replace:
+                if dry_run:
+                    log(f"      [DRY RUN] Would replace: {final_dst}")
+                else:
+                    final_dst.unlink()
+                    v_log(f"      [Replaced] {final_dst}", verbose)
+            else:
+                final_dst = unique_file_path(final_dst)
 
         moved_files += 1
         log(f"      [{moved_files}/{total_files}] {rel}")
@@ -160,7 +167,7 @@ def choose_tv_destination(show_name: str, existing_dirs: list[Path], new_dir: Pa
     return new_dir / show_name
 
 
-def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> None:
+def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool, replace: bool = False) -> None:
     new_dir = Path(NEW_TV_DIR)
     existing_dirs = [Path(d) for d in EXISTING_TV_DIRS]
 
@@ -176,6 +183,8 @@ def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> No
     log(f"  New shows:    {new_dir}")
     log(f"  Existing:     {', '.join(str(d) for d in existing_dirs)}")
     log(f"  Found {len(planned)} show folder(s)")
+    if replace:
+        log("  Mode:         REPLACE existing files")
 
     processed = 0
 
@@ -197,7 +206,7 @@ def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> No
 
             if dst_dir.exists():
                 log("    [Merge]")
-                merge_dirs(show_dir, dst_dir, dry_run, verbose)
+                merge_dirs(show_dir, dst_dir, dry_run, verbose, replace)
             else:
                 log("    [Move new]")
                 move_path(show_dir, dst_dir, dry_run, verbose)
@@ -207,7 +216,7 @@ def migrate_tv_library(old_roots: list[str], dry_run: bool, verbose: bool) -> No
 # MOVIE LOGIC (UNCHANGED)
 # =========================
 
-def migrate_library(old_roots: list[str], new_root: str, kind: str, dry_run: bool, verbose: bool) -> None:
+def migrate_library(old_roots: list[str], new_root: str, kind: str, dry_run: bool, verbose: bool, replace: bool = False) -> None:
     new_root_p = Path(new_root)
     ensure_dir(new_root_p, dry_run, verbose)
 
@@ -220,6 +229,8 @@ def migrate_library(old_roots: list[str], new_root: str, kind: str, dry_run: boo
     log(f"\n=== {kind} migration ===")
     log(f"  Destination: {new_root_p}")
     log(f"  Found {len(planned_items)} item folder(s)")
+    if replace:
+        log("  Mode:         REPLACE existing files")
 
     processed = 0
     for old in old_roots:
@@ -237,7 +248,7 @@ def migrate_library(old_roots: list[str], new_root: str, kind: str, dry_run: boo
 
             if dst_dir.exists():
                 log("    [Merge]")
-                merge_dirs(item_dir, dst_dir, dry_run, verbose)
+                merge_dirs(item_dir, dst_dir, dry_run, verbose, replace)
             else:
                 log("    [Move new]")
                 move_path(item_dir, dst_dir, dry_run, verbose)
@@ -250,6 +261,8 @@ def migrate_library(old_roots: list[str], new_root: str, kind: str, dry_run: boo
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Merge/migrate TV + Movie folders.")
     p.add_argument("--apply", action="store_true", help="Actually move files/folders.")
+    p.add_argument("--replace", action="store_true",
+                   help="Overwrite existing files at destination instead of adding (migrated N) suffix.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
     return p.parse_args(argv)
 
@@ -260,9 +273,11 @@ def main(argv: list[str]) -> int:
 
     log("=== Media Migration ===")
     log(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}")
+    if args.replace:
+        log("Replace: ON (existing files will be overwritten)")
 
-    migrate_tv_library(OLD_TV_DIRS, dry_run, verbose)
-    migrate_library(OLD_MOVIE_DIRS, NEW_MOVIE_DIR, "MOVIES", dry_run, verbose)
+    migrate_tv_library(OLD_TV_DIRS, dry_run, verbose, args.replace)
+    migrate_library(OLD_MOVIE_DIRS, NEW_MOVIE_DIR, "MOVIES", dry_run, verbose, args.replace)
 
     log("\nDone.")
     return 0

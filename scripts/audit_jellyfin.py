@@ -17,6 +17,7 @@ Run:
   python audit_jellyfin.py --drive D        # limit to one or more drives
   python audit_jellyfin.py --limit 50       # cap files per root (testing)
   python audit_jellyfin.py --cpu-limit 25   # cap tier-3 ffmpeg to 25% total CPU (Win8.1+)
+  python audit_jellyfin.py --no-limit       # tier-3 at full CPU, auto-threads (max throughput)
   python audit_jellyfin.py --clear-cache    # wipe the deep-decode cache
 
 Outputs land in scripts/audit_reports/:
@@ -39,6 +40,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 
 # ============================================================
 # CONFIG
@@ -288,7 +290,10 @@ def scan_orphans_and_empty_dirs(root: Path, drive: str):
             continue
         try:
             children = list(d.iterdir())
-        except PermissionError:
+        except OSError as e:
+            # WinError 433 ("device which does not exist") and other transient
+            # filesystem hiccups shouldn't kill a multi-hour run. Log and skip.
+            print(f"[warn] iterdir failed on {d}: {e}", flush=True)
             continue
         if not children:
             issues.append(make_issue(d, drive, "tier2", "info", "empty_dir", "", ""))
@@ -386,7 +391,28 @@ def load_cache():
 
 def save_cache(cache):
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    tmp = CACHE_FILE.with_suffix(".json.tmp")
+    data = json.dumps(cache, indent=2)
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        readback = json.loads(tmp.read_text(encoding="utf-8"))
+        if len(readback) < len(cache):
+            print(f"[WARN] cache write verification failed: wrote {len(cache)} entries, "
+                  f"read back {len(readback)}. Keeping old cache.", flush=True)
+            tmp.unlink(missing_ok=True)
+            return
+        for attempt in range(5):
+            try:
+                os.replace(str(tmp), str(CACHE_FILE))
+                return
+            except OSError:
+                if attempt < 4:
+                    time.sleep(0.2 * (attempt + 1))
+        print(f"[ERROR] save_cache: os.replace failed after 5 retries", flush=True)
+        tmp.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[ERROR] save_cache failed: {e}", flush=True)
+        tmp.unlink(missing_ok=True)
 
 
 # The only shape of ffmpeg output we permit: null muxer writing to stdout.
@@ -619,6 +645,9 @@ def main():
     ap.add_argument("--cpu-limit", type=int, default=0,
                     help="Cap tier-3 ffmpeg to N%% total CPU via Windows Job Object "
                          "(Win8.1+). 0 = no cap (use -threads 1 instead). Recommended: 25.")
+    ap.add_argument("--no-limit", action="store_true",
+                    help="Run tier-3 ffmpeg with no CPU cap and auto-threads "
+                         "(max throughput, loud fan). Mutually exclusive with --cpu-limit.")
     args = ap.parse_args()
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -631,17 +660,29 @@ def main():
             print("No cache to clear.")
         return
 
-    if args.cpu_limit < 0 or args.cpu_limit >= 100:
+    if args.no_limit and args.cpu_limit != 0:
+        print("[FATAL] --no-limit cannot be combined with --cpu-limit", file=sys.stderr)
+        sys.exit(2)
+    if args.no_limit:
+        args.cpu_limit = 100
+    elif args.cpu_limit < 0 or args.cpu_limit >= 100:
         print(f"[FATAL] --cpu-limit must be 0..99, got {args.cpu_limit}", file=sys.stderr)
         sys.exit(2)
-    if args.cpu_limit > 0 and sys.platform != "win32":
+    if 0 < args.cpu_limit < 100 and sys.platform != "win32":
         print("[WARN] --cpu-limit is Windows-only; ignoring.", file=sys.stderr)
         args.cpu_limit = 0
 
     if not acquire_lock():
         sys.exit(3)
 
+    # _run_audit sets this to its cache dict so signal handlers can save it
+    _active_cache = [None]
+
     def _cleanup_and_exit(signum, frame):
+        if _active_cache[0] is not None:
+            print(f"\n[signal] Saving cache ({len(_active_cache[0])} entries) before exit...",
+                  flush=True)
+            save_cache(_active_cache[0])
         release_lock()
         sys.exit(130)
 
@@ -655,12 +696,14 @@ def main():
         pass
 
     try:
-        _run_audit(args)
+        _run_audit(args, _active_cache)
     finally:
+        if _active_cache[0] is not None:
+            save_cache(_active_cache[0])
         release_lock()
 
 
-def _run_audit(args):
+def _run_audit(args, _active_cache=None):
     drive_filter = {d.upper().rstrip(":") for d in args.drive} if args.drive else None
 
     def _filter(root_list):
@@ -679,7 +722,9 @@ def _run_audit(args):
     print(f"PID:          {os.getpid()}")
     print(f"Deep mode:    {args.deep}")
     if args.deep:
-        if args.cpu_limit > 0:
+        if args.cpu_limit >= 100:
+            print(f"CPU cap:      none (--no-limit, auto-threads)")
+        elif args.cpu_limit > 0:
             print(f"CPU cap:      {args.cpu_limit}% (Job Object, threads auto)")
         else:
             print(f"CPU cap:      none (-threads 1)")
@@ -689,6 +734,8 @@ def _run_audit(args):
 
     all_issues = []
     cache = load_cache() if args.deep else {}
+    if _active_cache is not None:
+        _active_cache[0] = cache
     files_scanned = 0
     deep_since_save = 0
     start_time = datetime.now()
@@ -799,6 +846,181 @@ def _run_audit(args):
     print(f"Report:  {report_path}")
     print(f"Latest:  {latest_path}")
     print(f"Summary: {summary_path}")
+
+    if args.deep:
+        md_path = _generate_issues_md(cache, files_scanned)
+        print(f"Issues:  {md_path}")
+
+
+def _classify_error(detail):
+    if "Error opening input files" in detail:
+        return "container_unreadable"
+    if "/aac" in detail and "Invalid data" in detail:
+        return "aac_corrupt"
+    if "/h264" in detail and "Invalid data" in detail:
+        return "h264_corrupt"
+    if "non monotonically increasing dts" in detail:
+        return "bad_timestamps"
+    if "error while decoding MB" in detail:
+        return "macroblock_error"
+    if "Invalid data" in detail:
+        return "invalid_data"
+    if "File ended prematurely" in detail:
+        return "truncated"
+    if "Nothing was written" in detail:
+        return "empty_decode"
+    if "Last message repeated" in detail:
+        return "repeated_errors"
+    return "other"
+
+
+_ERR_DESCRIPTIONS = {
+    "container_unreadable": "File cannot be opened - completely broken, must redownload",
+    "h264_corrupt": "Video stream corruption - visual glitches/artifacts",
+    "aac_corrupt": "Audio stream corruption - audio pops/drops (often minor)",
+    "bad_timestamps": "Timestamp errors - may cause seeking issues (usually fine)",
+    "macroblock_error": "Video block decode failure - visible frame corruption",
+    "invalid_data": "Generic stream corruption - file partially broken",
+    "truncated": "File cut off mid-download - incomplete",
+    "empty_decode": "No decodable content - file is effectively empty",
+    "repeated_errors": "Flood of decode errors - severely corrupted",
+}
+
+_PRIORITY = {
+    "container_unreadable": 1,
+    "empty_decode": 1,
+    "truncated": 1,
+    "h264_corrupt": 2,
+    "macroblock_error": 2,
+    "invalid_data": 2,
+    "repeated_errors": 2,
+    "aac_corrupt": 3,
+    "bad_timestamps": 4,
+}
+
+_PRIORITY_LABELS = {
+    1: ("CRITICAL - Must Redownload", "Files completely broken - cannot be played at all"),
+    2: ("HIGH - Should Redownload", "Video quality affected - visual glitches/corruption"),
+    3: ("MEDIUM - Consider Redownloading", "Audio issues - brief pops or dropouts, often not noticeable"),
+    4: ("LOW - Probably Fine", "Minor technical issues - playback unlikely to be affected"),
+}
+
+
+def _generate_issues_md(cache, files_scanned):
+    from collections import defaultdict
+
+    errs = [(k, v) for k, v in cache.items() if v.get("result") == "error"]
+    if not errs:
+        md_path = REPORTS_DIR / "issues_report.md"
+        md_path.write_text("# Jellyfin Library Audit - Issues Report\n\nNo issues found.\n", encoding="utf-8")
+        return md_path
+
+    by_show = defaultdict(list)
+    for k, v in errs:
+        parts = k.split("\\")
+        if len(parts) >= 4 and "TV Shows" in parts[1]:
+            show, drive, ep = parts[2], parts[0], parts[-1]
+        elif len(parts) >= 3 and "Movies" in parts[1]:
+            show, drive, ep = parts[2], parts[0], parts[-1]
+        else:
+            show, drive, ep = "unknown", "?", parts[-1] if parts else k
+        etype = _classify_error(v.get("detail", ""))
+        by_show[show].append({"ep": ep, "type": etype, "drive": drive})
+
+    all_types = Counter(_classify_error(v.get("detail", "")) for _, v in errs)
+    lines = []
+    lines.append("# Jellyfin Library Audit - Issues Report")
+    lines.append("")
+    lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
+    lines.append(f"**Total files scanned:** {files_scanned:,}  ")
+    lines.append(f"**Total issues found:** {len(errs)} ({len(errs)/files_scanned*100:.1f}%)")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Summary
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Priority | Description | Files |")
+    lines.append("|----------|-------------|-------|")
+    for p in sorted(_PRIORITY_LABELS.keys()):
+        label, _ = _PRIORITY_LABELS[p]
+        count = sum(n for t, n in all_types.items() if _PRIORITY.get(t, 9) == p)
+        if count > 0:
+            lines.append(f"| **{label}** | {_PRIORITY_LABELS[p][1]} | {count} |")
+    lines.append("")
+
+    # Error types
+    lines.append("## Error Types")
+    lines.append("")
+    lines.append("| Type | Count | Severity | Description |")
+    lines.append("|------|-------|----------|-------------|")
+    for t, n in sorted(all_types.items(), key=lambda x: (_PRIORITY.get(x[0], 9), -x[1])):
+        desc = _ERR_DESCRIPTIONS.get(t, "Unknown")
+        p = _PRIORITY.get(t, 9)
+        sev = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}.get(p, "?")
+        lines.append(f"| `{t}` | {n} | {sev} | {desc} |")
+    lines.append("")
+
+    # Quick reference
+    lines.append("---")
+    lines.append("")
+    lines.append("## Quick Reference - Seasons to Redownload")
+    lines.append("")
+    lines.append("| Show | Drive | Seasons | Episodes | Severity |")
+    lines.append("|------|-------|---------|----------|----------|")
+
+    for show in sorted(by_show.keys(), key=lambda x: -len(by_show[x])):
+        eps = by_show[show]
+        if len(eps) < 3:
+            continue
+        drive = eps[0]["drive"]
+        seasons = set()
+        for e in eps:
+            m = re.search(r"S(\d+)", e["ep"])
+            if m:
+                seasons.add(int(m.group(1)))
+        s_str = ", ".join(f"S{s:02d}" for s in sorted(seasons)) if seasons else "various"
+        worst = min(_PRIORITY.get(e["type"], 9) for e in eps)
+        sev = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}.get(worst, "?")
+        lines.append(f"| {show} | {drive}: | {s_str} | {len(eps)} | {sev} |")
+    lines.append("")
+
+    # Detailed sections by priority
+    for p in sorted(_PRIORITY_LABELS.keys()):
+        label, desc = _PRIORITY_LABELS[p]
+        shows_at_p = {}
+        for show, eps in by_show.items():
+            matching = [e for e in eps if _PRIORITY.get(e["type"], 9) == p]
+            if matching:
+                shows_at_p[show] = matching
+
+        if not shows_at_p:
+            continue
+
+        lines.append("---")
+        lines.append("")
+        lines.append(f"## {label}")
+        lines.append("")
+        lines.append(f"> {desc}")
+        lines.append("")
+
+        for show in sorted(shows_at_p.keys(), key=lambda x: -len(shows_at_p[x])):
+            eps = shows_at_p[show]
+            drive = eps[0]["drive"]
+            types = Counter(e["type"] for e in eps)
+            type_str = ", ".join(f"`{t}`" for t, _ in types.most_common())
+            lines.append(f"### {show} ({drive}: drive) - {len(eps)} files")
+            lines.append("")
+            lines.append(f"Error types: {type_str}")
+            lines.append("")
+            for e in sorted(eps, key=lambda x: x["ep"]):
+                lines.append(f"- [ ] `{e['type']}` {e['ep']}")
+            lines.append("")
+
+    md_path = REPORTS_DIR / "issues_report.md"
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return md_path
 
 
 if __name__ == "__main__":
