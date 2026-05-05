@@ -35,6 +35,7 @@ hls-server/      Local Python download server
 | `/capture` | POST | Receive m3u8 URL, trigger yt-dlp download |
 | `/preview` | POST | Analyze m3u8, return filename/quality/show info (no download) |
 | `/subtitle` | POST | Receive VTT subtitle URL, download and convert to SRT if English |
+| `/subtitle-content` | POST | Receive raw subtitle text content (browser-fetched for BrocoFlix CDN) |
 | `/season-info` | POST | Log discovered episode list at start of each season (auto-capture) |
 | `/downloads` | GET | Active/completed download list with progress |
 | `/status` | GET | Health check, returns `{"dry_run": bool}` |
@@ -92,6 +93,13 @@ CDN blocks all non-browser clients (403). Current approach (Phase 3.2 — 100% s
 - If all retries exhausted, falls back to page reload (but 429 backoff typically recovers every segment)
 
 See memory file `brocoflix-download-attempts.md` for full approach history and what's been tried.
+
+### BrocoFlix Subtitles
+
+Three-layer approach (CDN 403s server-side `requests.get()`):
+1. **HLS manifest extraction**: `extractManifestSubtitles()` parses `#EXT-X-MEDIA:TYPE=SUBTITLES` from the master m3u8 during download, fetches English track content via service worker, relays to `/subtitle-content`
+2. **Auto-CC click**: `enableBrocoflixSubtitles()` injects into the embed iframe BEFORE the download starts (download pauses/destroys the video player), clicks the CC button and selects English — triggers subtitle network requests. Player uses custom `<pjsdiv>` elements (PJS player): CC button is `#player_parent_control_showSubtitles`, English option is `.lang[data-subkey='eng']`
+3. **Browser-side fetch**: `sendSubtitle()` detects BrocoFlix pages and fetches intercepted `.vtt`/`.srt` URLs in the service worker instead of sending the URL to the server
 
 ## Bat Files
 

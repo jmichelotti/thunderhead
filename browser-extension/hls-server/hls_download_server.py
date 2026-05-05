@@ -455,6 +455,11 @@ def download_m3u8(m3u8_url: str, output_path: Path, dry_run: bool, ep_key: str) 
 _pending_subs: Dict[str, list] = {}
 _pending_subs_lock = threading.Lock()
 
+# Pending subtitle content (browser-fetched, for BrocoFlix CDN that 403s server requests)
+# {ep_key: [(content_str, is_vtt), ...]}
+_pending_subs_content: Dict[str, list] = {}
+_pending_subs_content_lock = threading.Lock()
+
 # Resolved output dirs keyed by ep_key: {ep_key: (show_title, season, episode)}
 _resolved_episodes: Dict[str, tuple] = {}
 _resolved_lock = threading.Lock()
@@ -649,10 +654,10 @@ def download_subtitle(subtitle_url: str, ep_key: str):
 
     show_title, season, episode = episode_info
     if season is None or episode is None:
-        # Movie
+        # Movie — flat in Movies root, fix_file_names.py organizes later
         ep_tag = "Movie"
         srt_name = f"{show_title}.srt"
-        srt_path = MOVIE_OUTPUT_DIR / show_title / srt_name
+        srt_path = MOVIE_OUTPUT_DIR / srt_name
     else:
         ep_tag = f"S{season:02d}E{episode:02d}"
         srt_name = f"{show_title} {ep_tag}.srt"
@@ -694,6 +699,51 @@ def download_subtitle(subtitle_url: str, ep_key: str):
         print(f"  [{ep_tag}] Subtitle failed: {e}", flush=True)
 
 
+def save_subtitle_content(content: str, ep_key: str, is_vtt: bool = True):
+    """Save subtitle content directly (browser-fetched, e.g. BrocoFlix CDN)."""
+    with _resolved_lock:
+        episode_info = _resolved_episodes.get(ep_key)
+
+    if not episode_info:
+        with _pending_subs_content_lock:
+            _pending_subs_content.setdefault(ep_key, []).append((content, is_vtt))
+        return
+
+    show_title, season, episode = episode_info
+    if season is None or episode is None:
+        ep_tag = "Movie"
+        srt_name = f"{show_title}.srt"
+        srt_path = MOVIE_OUTPUT_DIR / srt_name
+    else:
+        ep_tag = f"S{season:02d}E{episode:02d}"
+        srt_name = f"{show_title} {ep_tag}.srt"
+        srt_path = OUTPUT_DIR / show_title / f"Season {season:02d}" / srt_name
+
+    with _saved_subs_lock:
+        if ep_key in _saved_subs or srt_path.exists():
+            return
+
+    try:
+        accepted, reason = is_english_subtitle(content)
+        if not accepted:
+            print(f"  [{ep_tag}] Subtitle rejected (browser-fetched): {reason}", flush=True)
+            return
+
+        with _saved_subs_lock:
+            if ep_key in _saved_subs:
+                return
+            _saved_subs.add(ep_key)
+
+        if is_vtt or content.strip().startswith("WEBVTT"):
+            content = vtt_to_srt(content)
+
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
+        srt_path.write_text(content, encoding="utf-8")
+        print(f"  [{ep_tag}] Subtitle saved (browser-fetched) — {srt_path.name}", flush=True)
+    except Exception as e:
+        print(f"  [{ep_tag}] Subtitle failed (browser-fetched): {e}", flush=True)
+
+
 def process_pending_subs(ep_key: str):
     """Process any subtitles that arrived before the video was resolved."""
     with _pending_subs_lock:
@@ -701,6 +751,12 @@ def process_pending_subs(ep_key: str):
 
     for url in urls:
         download_subtitle(url, ep_key)
+
+    with _pending_subs_content_lock:
+        contents = _pending_subs_content.pop(ep_key, [])
+
+    for content, is_vtt in contents:
+        save_subtitle_content(content, ep_key, is_vtt)
 
 
 # ========= BROCOFLIX SESSION MANAGEMENT =========
@@ -775,9 +831,16 @@ def brocoflix_start(body: dict) -> dict:
         }
 
     # Register resolved episode for subtitle matching
-    if season is not None and episode is not None:
-        with _resolved_lock:
+    with _resolved_lock:
+        if is_movie or (season is None and episode is None):
+            _resolved_episodes[ep_key] = (show_title, None, None)
+        else:
             _resolved_episodes[ep_key] = (show_title, season, episode)
+
+    # Process any subtitles that arrived before this session was created
+    threading.Thread(
+        target=process_pending_subs, args=(ep_key,), daemon=True
+    ).start()
 
     # Register in downloads tracker
     with _downloads_lock:
@@ -1019,6 +1082,7 @@ class HLSHandler(BaseHTTPRequestHandler):
         # Suppress noisy/redundant HTTP request logs
         if any(s in msg for s in ("GET /status", "GET /downloads", "GET /clear",
                                    "POST /capture", "POST /subtitle",
+                                   "POST /subtitle-content",
                                    "POST /preview", "POST /season-info",
                                    "POST /brocoflix-", "OPTIONS")):
             return
@@ -1091,6 +1155,43 @@ class HLSHandler(BaseHTTPRequestHandler):
         # Download in background
         threading.Thread(
             target=download_subtitle, args=(subtitle_url, ep_key), daemon=True
+        ).start()
+
+    def _handle_subtitle_content(self):
+        """Receive raw subtitle text content (browser-fetched for BrocoFlix CDN)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)}, 400)
+            return
+
+        content = body.get("content", "")
+        page_url = body.get("page_url", "")
+        is_vtt = body.get("is_vtt", True)
+
+        if not content:
+            self._send_json({"status": "error", "message": "missing content"}, 400)
+            return
+
+        info = parse_episode_info(body, page_url)
+        is_movie = info.get("is_movie", False)
+        if not info["show_slug"]:
+            self._send_json({"status": "skipped", "message": "cannot parse show"})
+            return
+        if not is_movie and (info["season"] is None or info["episode"] is None):
+            self._send_json({"status": "skipped", "message": "cannot parse episode"})
+            return
+
+        if is_movie:
+            ep_key = f"{info['show_slug']}|movie"
+        else:
+            ep_key = f"{info['show_slug']}|{info['season']}|{info['episode']}"
+
+        self._send_json({"status": "ok"})
+
+        threading.Thread(
+            target=save_subtitle_content, args=(content, ep_key, is_vtt), daemon=True
         ).start()
 
     def _handle_preview(self):
@@ -1206,6 +1307,9 @@ class HLSHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/subtitle":
             self._handle_subtitle()
+            return
+        if self.path == "/subtitle-content":
+            self._handle_subtitle_content()
             return
         if self.path == "/preview":
             self._handle_preview()

@@ -390,6 +390,23 @@ inspectBtn.addEventListener("click", () => {
   });
 });
 
+const inspectCCBtn = document.getElementById("inspectCCBtn");
+inspectCCBtn.addEventListener("click", () => {
+  inspectStatus.textContent = "inspecting iframe CC...";
+  inspectResults.style.display = "none";
+  copyInspectBtn.style.display = "none";
+  chrome.runtime.sendMessage({ type: "inspectIframeCC" }, (resp) => {
+    if (chrome.runtime.lastError || !resp) {
+      inspectStatus.textContent = "error — no active BrocoFlix session?";
+      return;
+    }
+    inspectStatus.textContent = "";
+    inspectResults.textContent = resp.result;
+    inspectResults.style.display = "block";
+    copyInspectBtn.style.display = "";
+  });
+});
+
 copyInspectBtn.addEventListener("click", () => {
   navigator.clipboard.writeText(inspectResults.textContent).then(() => {
     copyInspectBtn.textContent = "Copied!";

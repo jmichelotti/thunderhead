@@ -1,6 +1,7 @@
 const SERVER_URL = "http://localhost:9876/capture";
 const PREVIEW_URL = "http://localhost:9876/preview";
 const SUBTITLE_URL = "http://localhost:9876/subtitle";
+const SUBTITLE_CONTENT_URL = "http://localhost:9876/subtitle-content";
 const SEASON_INFO_URL = "http://localhost:9876/season-info";
 
 // ========= SITE CONFIGS =========
@@ -505,6 +506,45 @@ async function sendToServer(capture) {
 
 async function sendSubtitle(subtitleUrl, pageUrl, tabId) {
   const ctx = tabId != null ? (episodeContextByTab.get(tabId) || {}) : {};
+  const siteConfig = getSiteConfig(pageUrl);
+
+  // BrocoFlix CDN blocks server-side requests (403), so fetch the subtitle
+  // content in the service worker and relay it directly to the server.
+  if (siteConfig?.site === "brocoflix.xyz") {
+    try {
+      console.log(`[BF-sub] Intercepted subtitle URL, fetching browser-side: ${subtitleUrl.slice(0, 100)}`);
+      const resp = await fetch(subtitleUrl, {
+        mode: "cors",
+        credentials: "include",
+      });
+      if (!resp.ok) {
+        console.log(`[BF-sub] Subtitle fetch failed: HTTP ${resp.status}`);
+        return;
+      }
+      const content = await resp.text();
+      if (!content || content.length < 10) return;
+
+      const isVtt = content.trim().startsWith("WEBVTT") || subtitleUrl.toLowerCase().includes(".vtt");
+      await fetch(SUBTITLE_CONTENT_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          page_url: pageUrl,
+          is_vtt: isVtt,
+          show_name: ctx.show_name || "",
+          season: ctx.season ?? null,
+          episode: ctx.episode ?? null,
+        }),
+      });
+      console.log(`[BF-sub] Subtitle content relayed to server (${content.length} chars)`);
+    } catch (err) {
+      console.log(`[BF-sub] Browser-side subtitle fetch failed: ${err.message}`);
+    }
+    return;
+  }
+
+  // Standard path: send URL to server for download (works for 1movies etc.)
   try {
     await fetch(SUBTITLE_URL, {
       method: "POST",
@@ -700,6 +740,136 @@ async function fetchSegmentManifest(m3u8Url, extraHeaders) {
     );
 }
 
+// Parse English subtitle tracks from an HLS master manifest.
+// Returns [{name, language, uri}] for English tracks.
+function parseSubtitleTracks(manifestText, baseUrl) {
+  const tracks = [];
+  for (const line of manifestText.split("\n")) {
+    const m = line.match(/#EXT-X-MEDIA:(.+)/);
+    if (!m) continue;
+    const attrs = m[1];
+    if (!/TYPE=SUBTITLES/i.test(attrs)) continue;
+
+    const lang = attrs.match(/LANGUAGE="([^"]+)"/i)?.[1] || "";
+    const name = attrs.match(/NAME="([^"]+)"/i)?.[1] || "";
+    const uri = attrs.match(/URI="([^"]+)"/i)?.[1];
+    if (!uri) continue;
+
+    // Accept English variants: "en", "eng", "English", etc.
+    const langLower = lang.toLowerCase();
+    const nameLower = name.toLowerCase();
+    if (langLower === "en" || langLower === "eng" || nameLower.includes("english")) {
+      const fullUri = uri.startsWith("http") ? uri : new URL(uri, baseUrl).href;
+      tracks.push({ name, language: lang, uri: fullUri });
+    }
+  }
+  return tracks;
+}
+
+// Fetch subtitle content from a subtitle URI (may be a segmented m3u8 or a direct VTT).
+// Returns the full subtitle text or null.
+async function fetchSubtitleContent(subtitleUri, extraHeaders) {
+  try {
+    const resp = await fetch(subtitleUri, {
+      mode: "cors",
+      credentials: "include",
+      headers: extraHeaders || {},
+    });
+    if (!resp.ok) {
+      console.log(`[BF-sub] Subtitle fetch failed: HTTP ${resp.status} for ${subtitleUri.slice(0, 80)}`);
+      return null;
+    }
+    const text = await resp.text();
+
+    // If it's a direct VTT/SRT file, return as-is
+    if (text.trim().startsWith("WEBVTT") || text.includes(" --> ")) {
+      return text;
+    }
+
+    // If it's a segmented subtitle manifest, fetch all segments and concatenate
+    if (text.includes("#EXTINF") || text.includes("#EXT-X-TARGETDURATION")) {
+      const segUrls = text.split("\n")
+        .filter(line => line.trim() && !line.startsWith("#"))
+        .map(line => line.trim().startsWith("http")
+          ? line.trim()
+          : new URL(line.trim(), subtitleUri).href);
+
+      if (segUrls.length === 0) return null;
+
+      const parts = [];
+      for (const segUrl of segUrls) {
+        try {
+          const segResp = await fetch(segUrl, {
+            mode: "cors",
+            credentials: "include",
+            headers: extraHeaders || {},
+          });
+          if (segResp.ok) {
+            parts.push(await segResp.text());
+          }
+        } catch (err) {
+          console.log(`[BF-sub] Subtitle segment failed: ${err.message}`);
+        }
+      }
+      return parts.join("\n") || null;
+    }
+
+    return null;
+  } catch (err) {
+    console.log(`[BF-sub] Subtitle fetch error: ${err.message}`);
+    return null;
+  }
+}
+
+// Extract and relay English subtitles from the HLS master manifest to the server.
+async function extractManifestSubtitles(m3u8Url, extraHeaders, epCtx, pageUrl) {
+  try {
+    const resp = await fetch(m3u8Url, {
+      mode: "cors",
+      credentials: "include",
+      headers: extraHeaders || {},
+    });
+    if (!resp.ok) return;
+    const manifest = await resp.text();
+
+    if (!manifest.includes("#EXT-X-MEDIA")) return;
+
+    const tracks = parseSubtitleTracks(manifest, m3u8Url);
+    if (tracks.length === 0) {
+      console.log(`[BF-sub] No English subtitle tracks in manifest`);
+      return;
+    }
+
+    console.log(`[BF-sub] Found ${tracks.length} English subtitle track(s): ${tracks.map(t => t.name || t.language).join(", ")}`);
+
+    // Fetch the first English track
+    const content = await fetchSubtitleContent(tracks[0].uri, extraHeaders);
+    if (!content) {
+      console.log(`[BF-sub] Could not fetch subtitle content`);
+      return;
+    }
+
+    console.log(`[BF-sub] Subtitle content fetched (${content.length} chars), sending to server`);
+    const isVtt = content.trim().startsWith("WEBVTT");
+
+    await fetch(SUBTITLE_CONTENT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content,
+        page_url: pageUrl || "",
+        is_vtt: isVtt,
+        show_name: epCtx?.show_name || "",
+        season: epCtx?.season ?? null,
+        episode: epCtx?.episode ?? null,
+      }),
+    });
+    console.log(`[BF-sub] Subtitle relayed to server`);
+  } catch (err) {
+    console.log(`[BF-sub] Manifest subtitle extraction failed: ${err.message}`);
+  }
+}
+
 async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndices) {
   const alreadyDone = new Set(completedIndices || []);
   const session = brocoflixSessions.get(sessionId);
@@ -804,6 +974,13 @@ async function runBrocoflixSwDownload(sessionId, m3u8Url, tabId, completedIndice
     await setCdnHeaderRules(allDomains, embedOrigin);
   } catch (err) {
     console.log(`[BF-sw] DNR rule update for segment domains failed: ${err.message}`);
+  }
+
+  // Extract subtitles from master manifest (fire-and-forget, first pass only)
+  if (alreadyDone.size === 0) {
+    const epCtx = episodeContextByTab.get(tabId) || {};
+    extractManifestSubtitles(m3u8Url, replayHeaders, epCtx, session.pageUrl)
+      .catch(err => console.log(`[BF-sub] Background subtitle extraction failed: ${err.message}`));
   }
 
   const totalSegs = segments.length;
@@ -1150,6 +1327,136 @@ function injectMainWorldDownloader(sessionId, m3u8Url, tabId, frameId, completed
   });
 }
 
+// Inject into the BrocoFlix embed iframe to enable English subtitles.
+// Clicks the CC button, waits for the subtitle menu, and selects English.
+async function enableBrocoflixSubtitles(tabId, frameId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: "MAIN",
+      func: () => {
+        const ccSelectors = [
+          // PJS player (cloudnestra/BrocoFlix) — custom <pjsdiv> element
+          "#player_parent_control_showSubtitles",
+          // JW Player
+          ".jw-icon-cc", ".jw-icon-cc button",
+          // VideoJS
+          ".vjs-subs-caps-button", ".vjs-subtitles-button",
+          // Plyr
+          ".plyr__control[data-plyr='captions']",
+          // Generic
+          "[aria-label='Captions']", "[aria-label='Subtitles']",
+          "[aria-label='subtitles']", "[aria-label='captions']",
+          "[aria-label='Closed captions']",
+          "button[class*='caption']", "button[class*='subtitle']",
+          "button[class*='cc']", "button[class*='CC']",
+          "[class*='caption-button']", "[class*='subtitle-button']",
+          "[class*='cc-button']",
+        ];
+
+        function findCC() {
+          for (const sel of ccSelectors) {
+            const el = document.querySelector(sel);
+            if (el) return el;
+          }
+          // Fallback: look for any button/div/custom element with CC-related text
+          const allBtns = document.querySelectorAll("button, div[role='button'], [class*='icon'], pjsdiv");
+          for (const btn of allBtns) {
+            const text = (btn.textContent || "").toLowerCase().trim();
+            const ariaLabel = (btn.getAttribute("aria-label") || "").toLowerCase();
+            const cls = (btn.className || "").toString().toLowerCase();
+            const id = (btn.id || "").toLowerCase();
+            if (text === "cc" || text === "subtitles"
+                || ariaLabel.includes("caption") || ariaLabel.includes("subtitle")
+                || cls.includes("caption") || cls.includes("subtitle") || cls.includes("-cc")
+                || id.includes("subtitle") || id.includes("caption")) {
+              return btn;
+            }
+          }
+          return null;
+        }
+
+        function selectEnglish() {
+          // Direct data-attribute selectors (most reliable)
+          const directSelectors = [
+            // PJS player (cloudnestra/BrocoFlix)
+            ".lang[data-subkey='eng']", "[data-subkey='eng']",
+            // Generic data attributes
+            "li[data-language='en']", "li[data-language='eng']",
+            "[data-lang='en']", "[data-lang='eng']",
+          ];
+          for (const sel of directSelectors) {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); return el.textContent.trim(); }
+          }
+
+          // Menu item selectors with text matching
+          const menuSelectors = [
+            ".jw-settings-content-item",
+            ".vjs-menu-item", ".vjs-texttrack-settings",
+            "[class*='menu'] li", "[class*='menu'] button",
+            "[class*='Menu'] li", "[class*='Menu'] button",
+            "[class*='track'] li", "[class*='track'] button",
+            ".lang",
+          ];
+          for (const sel of menuSelectors) {
+            const items = document.querySelectorAll(sel);
+            for (const item of items) {
+              const text = (item.textContent || "").trim().toLowerCase();
+              if (text.includes("english")) {
+                item.click();
+                return item.textContent.trim();
+              }
+            }
+          }
+
+          // Broader search: any visible element containing "English"
+          const allEls = document.querySelectorAll("li, button, div, span[role='menuitem'], a");
+          for (const el of allEls) {
+            const text = (el.textContent || "").trim();
+            if (text.toLowerCase() === "english" && el.offsetParent !== null) {
+              el.click();
+              return text;
+            }
+          }
+          return null;
+        }
+
+        const ccBtn = findCC();
+        if (!ccBtn) return { found: false, step: "cc_button" };
+        ccBtn.click();
+
+        // Wait for subtitle menu/track list to appear, then select English
+        return new Promise(resolve => {
+          let attempts = 0;
+          const timer = setInterval(() => {
+            attempts++;
+            const selected = selectEnglish();
+            if (selected) {
+              clearInterval(timer);
+              resolve({ found: true, selected });
+            } else if (attempts >= 15) {
+              clearInterval(timer);
+              resolve({ found: true, step: "english_not_found" });
+            }
+          }, 300);
+        });
+      },
+    });
+
+    const result = results?.[0]?.result;
+    if (result?.selected) {
+      console.log(`[BF-sub] Auto-CC: selected "${result.selected}"`);
+    } else if (result?.step === "cc_button") {
+      console.log(`[BF-sub] Auto-CC: CC button not found in iframe`);
+    } else if (result?.step === "english_not_found") {
+      console.log(`[BF-sub] Auto-CC: clicked CC but English option not found`);
+    }
+  } catch (err) {
+    console.log(`[BF-sub] Auto-CC injection failed: ${err.message}`);
+  }
+}
+
 async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOpts) {
   // resumeOpts: { sessionId, completedIndices: number[] } when resuming after iframe reload
   // Client-side dedup: skip if this exact URL is already being downloaded
@@ -1242,6 +1549,15 @@ async function startBrocoflixDownload(m3u8Url, pageUrl, tabId, frameId, resumeOp
     captures.push(capture);
     if (captures.length > 50) captures = captures.slice(-50);
     updateBadge();
+  }
+
+  // Auto-enable subtitles in the embed iframe BEFORE the download starts
+  // (the download pauses/destroys the video player, removing the CC UI).
+  // This triggers subtitle network requests that our webRequest listener intercepts.
+  if (!resumeOpts) {
+    await enableBrocoflixSubtitles(tabId, frameId).catch(err => {
+      console.log(`[BF-sub] Auto-CC failed: ${err.message}`);
+    });
   }
 
   const completedIndices = resumeOpts?.completedIndices || [];
@@ -1969,6 +2285,103 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }).catch(() => {});
     cleanupBrocoflixSession(sessionId);
     sendResponse({ ok: true });
+  } else if (msg.type === "inspectIframeCC") {
+    // Find embed iframe in the active tab (doesn't require an active download session)
+    (async () => {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab) { sendResponse({ result: "No active tab" }); return; }
+
+      try {
+        const allResults = await chrome.scripting.executeScript({
+          target: { tabId: tab.id, allFrames: true },
+          world: "MAIN",
+          func: () => {
+            if (window === window.top) return null;
+            const vid = document.querySelector("video");
+            if (!vid) return null;
+
+            const lines = [];
+            lines.push(`URL: ${window.location.href.slice(0, 80)}`);
+            lines.push("");
+
+            // Full subtitle panel HTML
+            const subWin = document.querySelector(".subtitles_window, .subtitles, [class*='subtitle'], [class*='caption']");
+            if (subWin) {
+              lines.push("SUBTITLE PANEL (full HTML):");
+              lines.push(subWin.outerHTML.slice(0, 2000));
+              lines.push("");
+            }
+
+            // All elements in the video's parent container (the player controls)
+            const playerContainer = vid.closest("div[class]") || vid.parentElement;
+            if (playerContainer) {
+              lines.push(`PLAYER CONTAINER: <${playerContainer.tagName.toLowerCase()} class="${playerContainer.className}">`);
+              // Walk up one more level to get the controls bar
+              const wrapper = playerContainer.parentElement;
+              if (wrapper) {
+                lines.push(`WRAPPER: <${wrapper.tagName.toLowerCase()} class="${wrapper.className}">`);
+                lines.push("WRAPPER CHILDREN:");
+                for (const child of wrapper.children) {
+                  const tag = child.tagName.toLowerCase();
+                  const id = child.id ? ` id="${child.id}"` : "";
+                  const cls = child.className ? ` class="${child.className}"` : "";
+                  lines.push(`  <${tag}${id}${cls}> (${child.children.length} children)`);
+                  // One level deeper for controls
+                  for (const gc of child.children) {
+                    const gTag = gc.tagName.toLowerCase();
+                    const gId = gc.id ? ` id="${gc.id}"` : "";
+                    const gCls = gc.className ? ` class="${gc.className}"` : "";
+                    const gText = gc.textContent.trim().slice(0, 40);
+                    const gSvg = gc.querySelector("svg") ? " [SVG]" : "";
+                    const gClick = gc.onclick ? " [onclick]" : "";
+                    lines.push(`    <${gTag}${gId}${gCls}>${gSvg}${gClick} ${gText ? `"${gText}"` : ""}`);
+                  }
+                }
+              }
+            }
+            lines.push("");
+
+            // All elements with 'pjs' in id or class
+            lines.push("PJS ELEMENTS:");
+            document.querySelectorAll("[id*='pjs'], [class*='pjs']").forEach(el => {
+              const tag = el.tagName.toLowerCase();
+              const id = el.id ? ` id="${el.id}"` : "";
+              const cls = el.className ? ` class="${el.className}"` : "";
+              lines.push(`  <${tag}${id}${cls}>`);
+            });
+            lines.push("");
+
+            // All SVG-containing elements (icons are usually the CC toggle)
+            lines.push("ALL SVG CONTAINERS:");
+            document.querySelectorAll("svg").forEach(svg => {
+              const parent = svg.parentElement;
+              if (!parent) return;
+              const tag = parent.tagName.toLowerCase();
+              const id = parent.id ? ` id="${parent.id}"` : "";
+              const cls = parent.className ? ` class="${parent.className}"` : "";
+              const title = parent.getAttribute("title") || "";
+              lines.push(`  <${tag}${id}${cls}> title="${title}" svgHTML=${svg.outerHTML.slice(0, 150)}`);
+            });
+
+            lines.push("");
+            lines.push(`VIDEO textTracks: ${vid.textTracks?.length || 0}`);
+
+            return lines.join("\n");
+          },
+        });
+
+        const iframeResults = allResults.filter(r => r.result !== null);
+        if (iframeResults.length === 0) {
+          sendResponse({ result: "No iframes with content found in active tab" });
+        } else {
+          const output = iframeResults.map((r, i) => `--- IFRAME ${i + 1} (frameId ${r.frameId}) ---\n${r.result}`).join("\n\n");
+          sendResponse({ result: output });
+        }
+      } catch (err) {
+        sendResponse({ result: `Injection failed: ${err.message}` });
+      }
+    })();
+    return true;
   } else if (msg.type === "setEpisodeContext") {
     // Content script reports which episode is playing (for DOM-based sites like brocoflix)
     const tabId = sender.tab?.id;
