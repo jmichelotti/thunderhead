@@ -327,6 +327,26 @@ async def find_and_click_result(tab, title, year):
             const items = [];
             const seen_href = new Set();
 
+            // Helper: get text from a link or its parent card container
+            function getCardText(a) {
+                let text = a.innerText.trim();
+                if (text) return text.substring(0, 80);
+                // 1movies: title is in a sibling element, look at parent card
+                const card = a.closest('[class*="item"], [class*="card"], [class*="film"]');
+                if (card) {
+                    text = card.innerText.trim();
+                    if (text) return text.substring(0, 80);
+                }
+                // Try next sibling
+                let sib = a.nextElementSibling;
+                while (sib) {
+                    text = sib.innerText.trim();
+                    if (text) return text.substring(0, 80);
+                    sib = sib.nextElementSibling;
+                }
+                return '';
+            }
+
             // Prefer links to info/detail pages
             for (const a of document.querySelectorAll('a[href*="info"], a[href*="detail"], a[href*="movie"], a[href*="watch"]')) {
                 const img = a.querySelector('img');
@@ -335,10 +355,11 @@ async def find_and_click_result(tab, title, year):
                 if (rect.width < 30 || rect.height < 30) continue;
                 if (seen_href.has(a.href)) continue;
                 seen_href.add(a.href);
+                const text = getCardText(a);
                 items.push({
-                    text: a.innerText.trim().substring(0, 80),
+                    text: text,
                     href: a.href,
-                    hasYear: a.innerText.includes(year) || a.href.includes(year),
+                    hasYear: text.includes(year) || a.href.includes(year),
                 });
             }
 
@@ -368,8 +389,9 @@ async def find_and_click_result(tab, title, year):
                 const rect = a.getBoundingClientRect();
                 if (rect.width < 30 || rect.height < 30) continue;
                 seen_href.add(a.href);
+                const fbText = getCardText(a);
                 items.push({
-                    text: a.innerText.trim().substring(0, 80),
+                    text: fbText,
                     href: a.href,
                     hasYear: a.innerText.includes(year) || a.href.includes(year),
                 });
