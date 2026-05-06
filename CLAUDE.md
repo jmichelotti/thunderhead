@@ -27,8 +27,9 @@ thunderhead/
 │   ├── run_audit.bat              wrapper for nightly Task Scheduler job
 │   └── audit_reports/             CSV reports, summary, issues .md, deep-decode cache (gitignored)
 ├── browser-extension/
-│   ├── hls-capture/   background.js, content.js, popup.html, popup.js, manifest.json
-│   └── hls-server/    hls_download_server.py, read_server_log.py, *.bat files
+│   ├── hls-capture/      background.js, content.js, popup.html, popup.js, manifest.json
+│   ├── hls-server/       hls_download_server.py, read_server_log.py, *.bat files
+│   └── auto-download/    auto_download_vivaldi.py — automated movie/show download via CDP
 ├── analytics/
 │   ├── app.py                 FastAPI server (port 1201), all endpoints
 │   ├── jellyfin_client.py     async Jellyfin API wrapper

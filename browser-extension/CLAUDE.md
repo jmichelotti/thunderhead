@@ -1,6 +1,6 @@
 # Browser Extension — HLS Capture for Jellyfin
 
-Two-part system: a Chrome/Vivaldi Manifest V3 extension captures HLS stream URLs, and a local Python server downloads them with Jellyfin-friendly naming.
+Three-part system: a Chrome/Vivaldi Manifest V3 extension captures HLS stream URLs, a local Python server downloads them with Jellyfin-friendly naming, and an automation script drives the browser end-to-end.
 
 ## Architecture
 
@@ -18,6 +18,12 @@ hls-server/      Local Python download server
   restart_server.bat       Kill existing server process and restart in background (pythonw)
   stop_server.bat          Kill server process
   setup_server_task.bat    Register Windows scheduled task for auto-start at logon (run as admin)
+
+auto-download/   Automated download pipeline (Vivaldi + nodriver CDP)
+  auto_download_vivaldi.py   Main script — search, navigate, play, capture, download
+  auto_download.py           CloakBrowser approach (archived, blocked by embed detection)
+  PROGRESS.md                Development log, bugs, test results
+  screenshots/               Debug screenshots from each run (gitignored)
 ```
 
 ## Server
@@ -109,3 +115,40 @@ All bat files have hardcoded path `C:\dev\thunderhead\browser-extension\hls-serv
 - `restart_server.bat` — Kills existing process (by name, command line, and port), restarts via `pythonw` (background)
 - `stop_server.bat` — Kills server process via PowerShell WMI query
 - `setup_server_task.bat` — Creates `schtasks` entry for auto-start at logon (requires admin)
+
+## Auto-Download Pipeline
+
+Fully automated download: search a streaming site, navigate to the result, start playback, capture the m3u8, confirm the download, and monitor until complete. Uses real Vivaldi browser via nodriver (CDP) — zero bot detection surface.
+
+### Usage
+
+```
+# Movies (BrocoFlix, Server 2)
+python auto_download_vivaldi.py "The Thing" 1982
+python auto_download_vivaldi.py "Total Recall" 1990 "True Lies" 1994
+
+# TV Shows (1movies, Server 1)
+python auto_download_vivaldi.py --show "Daredevil Born Again" --season 1 --episode 1
+python auto_download_vivaldi.py --show "Daredevil Born Again" --season 1 --episodes 2-9
+python auto_download_vivaldi.py --show "Daredevil Born Again" --seasons 1-2
+```
+
+### Requirements
+
+- Vivaldi browser with automation profile at `C:\Temp_Media\_vivaldi_automation`
+- HLS capture extension loaded in the automation profile (one-time: `python auto_download_vivaldi.py --setup`)
+- HLS server running (`start_server.bat`)
+- Python: `nodriver`, `websockets`, `requests`
+
+### How it works
+
+- **Movies**: launches Vivaldi, searches BrocoFlix, clicks result, clicks Watch Now + Server 2, clicks iframe to play, confirms m3u8 capture via CDP websocket to extension service worker, monitors BrocoFlix browser-side upload until done
+- **TV shows (single episode)**: navigates to 1movies, searches, clicks show, sets `location.hash` to correct episode, clicks play button, confirms m3u8 via service worker, yt-dlp downloads
+- **TV shows (range/seasons)**: same navigation, then triggers extension auto-capture via `startAutoCapture` message to service worker, forces episode range after DOM discovery, monitors auto-capture state + yt-dlp downloads
+- **Multi-movie**: each movie gets its own Vivaldi instance (separate CDP port + cloned profile), downloads in parallel
+
+### Key pattern: `js()` helper
+
+All JS evaluation uses `js(tab, expr)` which calls CDP `Runtime.evaluate` directly and recursively unwraps deep-serialized values. All JS must be IIFEs: `"(() => { ... })()"`. nodriver's `tab.evaluate()` has multiple bugs with return values.
+
+See `auto-download/PROGRESS.md` for full development history, bugs fixed, and test results.

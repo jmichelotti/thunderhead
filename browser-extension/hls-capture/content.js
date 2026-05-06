@@ -225,7 +225,7 @@ function waitForEpisodeDone(timeoutMs) {
 function getCurrentSite() {
   const host = window.location.hostname;
   if (host.includes("brocoflix.xyz")) return "brocoflix.xyz";
-  if (host.includes("1movies.bz")) return "1movies.bz";
+  if (host.includes("1movies")) return "1movies";
   return null;
 }
 
